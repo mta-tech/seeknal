@@ -318,7 +318,9 @@ python -m seeknal.serving validate --config /etc/seeknal/serving.yaml
      - Static `placement.pii_tables` and `placement.policy.pii_tables` entries fold directly into `TableEntry.pii = True` (or `CubeEntry.pii = True`), and referencing an unknown table raises `PlacementError`.
      - Semantic cubes may optionally declare `pii: true` (`cubes.<cube>.pii: true` or via `pii_tables`), which requires that Cube engine to be explicitly listed in `policy.pii_engines`.
      - A `pii: true` table cannot be served on a `duckdb` engine (whether `local_file` or `iceberg_direct`) unless that engine name is explicitly listed in `policy.pii_engines`.
-     - In discovery mode, every `pii_tables` and `synced_tables` entry must be an unquoted 3-part `<default_catalog>.<namespace>.<table>` identifier, and any PII entry matching no discovered Iceberg table raises `DiscoveryError`. When multiple engines could serve a discovered PII table, `discover()` selects a single serve in priority order: synced Lakebase (`lakebase.engine`), first non-DuckDB engine (e.g. StarRocks), first approved engine in `pii_engines`.
+     - **Storage-class PII rule:** Every connection has an effective `storage_class` (`local` by default for `kind: postgres` and `duckdb` `local_file`; fixed `object_storage` for `lakebase` with a `lakebase:` block and `duckdb` `iceberg_direct`; `object_storage` when omitted on `starrocks` and `cube`; `unknown` on legacy `kind: lakebase` without a block). Untokenized `pii: true` tables (and cubes) may be served only on `local` engines unless the engine is explicitly listed in `policy.pii_object_storage_engines`. Tables with `tokenized: true` hold no plaintext PII and are exempt. `storage_class` may only be declared on `connections.<name>`, never inside `placement`.
+     - **Table `access:` metadata:** Validates `pattern` (`point`, `filter`, `scan`), requires non-empty `keys` when `pattern == "point"`, and verifies every column in `access.{keys,filterable,range_filterable,prefix_filterable,sortable}` exists in `schemas.json`.
+     - In discovery mode, every `pii_tables` and `synced_tables` entry must be an unquoted 3-part `<catalog>.<namespace>.<table>` identifier, `postgres_sources` engines and accounts are verified against `connections`, and any PII entry matching no discovered table raises `DiscoveryError`.
      - Duplicate YAML keys at any nesting level in `serving.yaml`, static `placement.yaml`, or discovery YAML configs are rejected fail-closed (`UniqueKeySafeLoader`).
      - At query time, `check_pii_query_mixing()` and the router reject any statement that joins or combines a `pii: true` table or cube across engines—or supplies an engine hint targeting another engine—with typed error code `pii_cross_engine` (**HTTP 422**) before any engine is called.
 
@@ -538,9 +540,16 @@ A `duckdb` connection may optionally set `profile: iceberg_direct` (default `loc
 
 ---
 
-## 9. Lakebase Connection Pool & Sizing Guidance
+## 9. Postgres & Lakebase Connection Pool, Sizing & Migration
 
-When querying Lakebase (PostgreSQL), Seeknal Serving manages a thread-safe connection pool per Lakebase endpoint to eliminate connection establishment overhead.
+When querying PostgreSQL (`kind: postgres`) or Atlas Lakebase (`kind: lakebase`), Seeknal Serving manages a shared thread-safe `PostgresPool` (`LakebasePool` alias) per distinct credential.
+
+### Migrating Legacy `kind: lakebase` Configs to `kind: postgres`
+Earlier configurations declared plain PostgreSQL databases as `kind: lakebase` without a `lakebase:` endpoint block. Such legacy configurations continue to work identically and emit a deprecation warning during `validate` and startup. When migrating a plain PostgreSQL database (such as the CBN report DB or lab `lb`):
+1. Change `kind: lakebase` to `kind: postgres` in both `connections.<name>` and `placement` (`engines.<name>`). Physical table names and placement keys remain unchanged.
+2. `kind: postgres` defaults to `mode: read_only` (`storage_class: local`). Set `mode: read_write` **only** if Serving writes are still required.
+3. Add a `session:` hardening block (`statement_timeout_ms`, `lock_timeout_ms`, `idle_in_transaction_session_timeout_ms`, `search_path: pg_catalog`) and `tls: {sslmode: verify-full, sslrootcert_file: ...}`.
+4. Connect using least-privilege SQL-created roles (`NOSUPERUSER NOBYPASSRLS`); for Atlas Lakebase (`kind: lakebase` with a `lakebase:` block), never use API-created `neon_superuser` roles. See [`postgres-sources.md`](postgres-sources.md) and [`lakebase-sources.md`](lakebase-sources.md).
 
 ### Connection Configuration Keys
 | Key | Type | Default | Description |

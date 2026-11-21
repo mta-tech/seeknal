@@ -470,8 +470,9 @@ def test_claims_validation_column_both_visible_and_masked():
         "sub": "u", "ws": "w", "jti": "j", "sql_sha256": "x", "max_rows": 10, "exp": 1000,
         "tables": {"t": {"columns": ["patient_nik"], "masks": {"PATIENT_NIK": "hash"}, "actions": ["select"]}},
     }
-    with pytest.raises(EnforcementError, match="column 'patient_nik' is both visible and masked"):
+    with pytest.raises(EnforcementError, match="column 'patient_nik' is both visible and masked") as exc_info:
         Grant.from_claims(claims)
+    assert exc_info.value.code == "access_denied"
 
 
 def test_claims_validation_non_positive_max_rows():
@@ -1291,4 +1292,136 @@ def test_http_table_functions_rejected_end_to_end(
     assert body["next_step"] == spec.next_step
     assert body["audit_id"] == jti
     assert "s3://bucket" not in resp.text
+
+
+# ==============================================================================
+# Governed Select API (api="select.v1") & Postgres Target Kind
+# ==============================================================================
+
+
+def test_postgres_target_kind_and_select_v1_grant_claims():
+    raw_body = b'{"table":"claims.claim","columns":["claim_id"]}'
+    base_claims = {
+        "sub": "user:7f3c",
+        "ws": "claims-jabar",
+        "jti": "aud-sel-01",
+        "sql_sha256": hashlib.sha256(raw_body).hexdigest(),
+        "max_rows": 100,
+        "exp": time.time() + 3600.0,
+        "api": "select.v1",
+        "sql_dialect": "postgres",
+        "tables": {
+            "claims.claim": {
+                "columns": ["claim_id", "province"],
+                "masks": {"patient_name": "redact"},
+                "row_filters": [{"column": "province", "op": "eq", "values": ["JB"]}],
+                "actions": ["select"],
+            }
+        },
+    }
+    grant = Grant.from_claims(base_claims)
+    assert grant.api == "select.v1"
+    assert grant.sql_dialect == "postgres"
+
+    # Invalid api values rejected with grant_invalid in both from_claims and __post_init__
+    for bad_api in ("select.v2", "query.v1", "", True, 123, ["select.v1"]):
+        with pytest.raises(EnforcementError) as exc_fc:
+            Grant.from_claims({**base_claims, "api": bad_api})
+        assert exc_fc.value.code == "grant_invalid"
+
+        with pytest.raises(EnforcementError) as exc_pi:
+            Grant(
+                subject=grant.subject,
+                workspace=grant.workspace,
+                audit_id=grant.audit_id,
+                sql_sha256=grant.sql_sha256,
+                max_rows=grant.max_rows,
+                expires_at=grant.expires_at,
+                tables=grant.tables,
+                api=bad_api,  # type: ignore[arg-type]
+            )
+        assert exc_pi.value.code == "grant_invalid"
+
+    # select.v1 requires sql_dialect == 'postgres' and params_sha256 is None
+    with pytest.raises(EnforcementError) as exc_dial:
+        Grant.from_claims({**base_claims, "sql_dialect": "duckdb"})
+    assert exc_dial.value.code == "grant_invalid"
+
+    with pytest.raises(EnforcementError) as exc_ps:
+        Grant.from_claims({**base_claims, "params_sha256": "a" * 64})
+    assert exc_ps.value.code == "grant_invalid"
+
+    # enforce() accepts raw bytes, supports target_kind='postgres', renders redacted_sql,
+    # and raises code='grant_invalid' on body SHA-256 mismatch for select.v1
+    stmt = sqlglot.parse_one(
+        "SELECT claim_id, patient_name FROM claims.claim WHERE claim_id = $1",
+        read="postgres",
+    )
+    schemas = {"claims.claim": ["claim_id", "patient_name", "province"]}
+    enforced = enforce(
+        raw_body,
+        grant,
+        schemas=schemas,
+        target_dialect="postgres",
+        target_kind="postgres",
+        statement=stmt,
+        params=(10,),
+    )
+    assert enforced.tables == ("claims.claim",)
+    assert enforced.masked_columns == ("claims.claim.patient_name",)
+    assert "SELECT claim_id, patient_name FROM claims.claim WHERE claim_id =" in enforced.redacted_sql
+
+    with pytest.raises(EnforcementError) as exc_mismatch:
+        enforce(
+            raw_body + b" ",
+            grant,
+            schemas=schemas,
+            target_dialect="postgres",
+            target_kind="postgres",
+            statement=stmt,
+            params=(10,),
+        )
+    assert exc_mismatch.value.code == "grant_invalid"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH i AS (INSERT INTO claims.claim (claim_id, amount) VALUES (999, 1) RETURNING 1 AS x) SELECT 1 AS one",
+        "WITH i AS (INSERT INTO claims.claim (claim_id) SELECT 5 RETURNING 1 AS x) SELECT count(*) AS n FROM i",
+        "WITH u AS (UPDATE claims.claim SET amount = 2 WHERE claim_id = 1 RETURNING claim_id) SELECT * FROM u",
+        "WITH d AS (DELETE FROM claims.claim WHERE claim_id = 1 RETURNING claim_id) SELECT * FROM d",
+    ],
+)
+def test_dml_inside_cte_is_rejected(sql: str):
+    schemas = {"claims.claim": ["claim_id", "amount"]}
+    for granted_actions in (["select"], ["select", "insert", "update", "delete"]):
+        grant = Grant.from_claims(
+            {
+                "sub": "user:analyst",
+                "ws": "claims",
+                "jti": "jti-cte-dml",
+                "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+                "max_rows": 100,
+                "exp": time.time() + 3600.0,
+                "tables": {
+                    "claims.claim": {
+                        "columns": ["claim_id", "amount"],
+                        "masks": {},
+                        "row_filters": [],
+                        "actions": granted_actions,
+                    }
+                },
+            }
+        )
+        with pytest.raises(EnforcementError, match="DML statements inside CTEs"):
+            enforce(
+                sql,
+                grant,
+                schemas=schemas,
+                target_dialect="postgres",
+                target_kind="postgres",
+            )
+
+
 

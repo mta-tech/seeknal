@@ -1263,6 +1263,7 @@ def test_e_m2_discovery_initial_refresh_failure_exits_2_before_serving(
     monkeypatch.setenv("EM2_LK_SECRET", lk_secret)
     monkeypatch.setenv("EM2_S3_KEY", "AKIAEXAMPLE")
     monkeypatch.setenv("EM2_S3_SECRET", s3_secret)
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "em2-cursor-signing-key-32-bytes-ok")
 
     ext_dir = tmp_path / "duck_exts"
     ext_dir.mkdir()
@@ -1321,7 +1322,11 @@ def test_e_m2_discovery_initial_refresh_failure_exits_2_before_serving(
                     }
                 },
                 "connections": {
-                    "lb": {"kind": "lakebase", "dsn_env": "EM2_LB_DSN"},
+                    "lb": {
+                        "kind": "lakebase",
+                        "dsn_env": "EM2_LB_DSN",
+                        "storage_class": "local",
+                    },
                     "duck_ice": {
                         "kind": "duckdb",
                         "profile": "iceberg_direct",
@@ -1389,6 +1394,7 @@ def test_e_m2_discovery_initial_refresh_failure_exits_2_before_serving(
                 "connections": {
                     "sr": {
                         "kind": "starrocks",
+                        "storage_class": "local",
                         "accounts": {
                             "interactive": {
                                 "host": "sr.internal",
@@ -1468,7 +1474,11 @@ def test_e_m2_discovery_initial_refresh_failure_exits_2_before_serving(
                     }
                 },
                 "connections": {
-                    "lb": {"kind": "lakebase", "dsn_env": "EM2_LB_DSN"},
+                    "lb": {
+                        "kind": "lakebase",
+                        "dsn_env": "EM2_LB_DSN",
+                        "storage_class": "local",
+                    },
                     "sr": {
                         "kind": "starrocks",
                         "accounts": {

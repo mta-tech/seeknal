@@ -16,6 +16,7 @@ from seeknal.serving.adapters import (
     EnginePoolExhausted,
     EngineTimeout,
     LakebasePool,
+    PostgresPool,
     QueryResult,
 )
 from seeknal.serving.service import PreparedQuery
@@ -573,3 +574,42 @@ def test_minimal_dbapi_driver_sequential_queries_reuse():
     assert res_next.rows == [(2,)]
     assert len(created_conns) == 2
     pool.close()
+
+
+def test_postgres_pool_alias_and_postgres_kind_reuse():
+    """LakebasePool is an alias for PostgresPool and serves kind='postgres'."""
+    assert LakebasePool is PostgresPool
+
+    driver = FakeDriver()
+    pool = PostgresPool(driver.connect, pool_max=4, pool_min=0)
+    adapter = DBAPIAdapter(
+        driver.connect,
+        kind="postgres",
+        pool=pool,
+        read_only=True,
+    )
+
+    def _pg_prep(audit_id: str) -> PreparedQuery:
+        return PreparedQuery(
+            engine="pg_report",
+            engine_kind="postgres",
+            sql="SELECT 1",
+            params=(),
+            paramstyle="format",
+            rule="test",
+            reason="test",
+            row_limit=10,
+            masked_columns=(),
+            redacted_sql="SELECT %s",
+            subject="test@example.com",
+            workspace="ws-test",
+            audit_id=audit_id,
+            cube_security_context=None,
+        )
+
+    r1 = adapter.execute(_pg_prep("pg-1"), timeout_seconds=5.0)
+    r2 = adapter.execute(_pg_prep("pg-2"), timeout_seconds=5.0)
+    assert r1.rows == r2.rows
+    assert len(driver.connections) == 1
+    pool.close()
+

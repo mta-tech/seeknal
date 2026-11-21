@@ -40,6 +40,7 @@ from seeknal.serving.grant_token import (
 from seeknal.serving.http import GrantReplayedError, create_app
 from seeknal.serving.metrics import (
     ALLOWED_GRANT_REJECTION_REASONS,
+    ALLOWED_ROUTES,
     DEFAULT_DURATION_BUCKETS,
     PROMETHEUS_CONTENT_TYPE,
     MetricsRegistry,
@@ -965,7 +966,11 @@ def test_public_port_has_no_metrics_or_buildinfo_by_default(tmp_path):
             },
         }
     )
-    handle = build_server(srv_cfg, connect_factories={"duck": lambda: duckdb.connect()})
+    handle = build_server(
+        srv_cfg,
+        connect_factories={"duck": lambda: duckdb.connect()},
+        cursor_key="test-ops-cursor-key-32-bytes-ok-xx",
+    )
     assert handle.ops_app is None
     assert handle.metrics is not None
     # Unpacking ServerHandle continues to yield (app, pipeline, refresher)
@@ -1169,6 +1174,7 @@ def test_build_server_end_to_end_ops_app_public_flags_caching_and_metrics(tmp_pa
         env=env,
         connect_factories={"lakebase": lb_connect},
         readiness_clock=lambda: fake_clock[0],
+        cursor_key="test-ops-cursor-key-32-bytes-ok-xx",
     )
     assert handle.ops_app is not None
     assert handle.metrics is not None
@@ -1419,6 +1425,7 @@ def test_public_opt_in_flags_and_audit_failure_metrics(tmp_path):
         cfg_public_opt_in,
         env={"LB_DSN": "postgresql://u:p@localhost/db"},
         connect_factories={"lakebase": lambda: MagicMock()},
+        cursor_key="test-ops-cursor-key-32-bytes-ok-xx",
     )
     assert handle_opt.ops_app is None
     with TestClient(handle_opt.app) as pub_c:
@@ -1490,6 +1497,7 @@ def test_cli_main_starts_and_stops_ops_listener_and_keeps_version_and_validate(
     _, jwks_file, db_file, pf, sf = _setup_test_keys_and_catalog(tmp_path)
     monkeypatch.setenv("LB_DSN_CLI", "postgresql://u:p@localhost/db")
     monkeypatch.setenv("OPS_TOK_CLI", "cli-ops-secret")
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "cli-ops-cursor-secret-32-bytes-ok")
 
     import yaml
 
@@ -2001,6 +2009,7 @@ def test_c_n5_ops_readyz_reports_audit_sink_not_ready_in_refuse_mode_only(tmp_pa
         cfg_refuse,
         env={"LB_DSN_N5": "postgresql://u:p@localhost:5432/db"},
         connect_factories={"lakebase": lambda **kw: MagicMock()},
+        cursor_key="test-ops-cursor-key-32-bytes-ok-xx",
     )
     assert handle.ops_app is not None
 
@@ -2050,6 +2059,443 @@ def test_c_n5_ops_readyz_reports_audit_sink_not_ready_in_refuse_mode_only(tmp_pa
     st_log, body_log = probe_log.check()
     assert st_log == 200
     assert body_log == {"ready": True, "engines": {"duck": "ok"}}
+
+
+# ---------------------------------------------------------------------------
+# 8. Multi-source Postgres, Lakebase Cold-Start, Select Route & Readiness "starting"
+# ---------------------------------------------------------------------------
+
+
+def test_run3_postgres_pool_guard_sync_discovery_and_lakebase_metrics():
+    from seeknal.serving.adapters import PostgresPool
+
+    assert "/v1/select" in ALLOWED_ROUTES
+
+    class FakeConn:
+        closed = 0
+
+        def close(self):
+            self.closed = 1
+
+    pg_pool_bi = PostgresPool(lambda: FakeConn(), pool_max=4)
+    pg_pool_ask = PostgresPool(lambda: FakeConn(), pool_max=2)
+    lb_pool = PostgresPool(lambda: FakeConn(), pool_max=4)
+
+    try:
+        c_bi_1 = pg_pool_bi.acquire()
+        c_bi_2 = pg_pool_bi.acquire()
+        pg_pool_bi.release(c_bi_1, success=True)  # 1 in_use, 1 idle
+
+        c_ask = pg_pool_ask.acquire()  # 1 in_use, 0 idle
+        c_lb = lb_pool.acquire()
+        lb_pool.release(c_lb, success=True)  # 0 in_use, 1 idle
+
+        pg_routed = WorkloadRoutedAdapter(
+            {
+                "interactive": DBAPIAdapter(
+                    lambda: FakeConn(),
+                    kind="postgres",
+                    pool=pg_pool_bi,
+                    account="interactive",
+                ),
+                "bi": DBAPIAdapter(
+                    lambda: FakeConn(),
+                    kind="postgres",
+                    pool=pg_pool_bi,
+                    account="bi",
+                ),
+                "ask": DBAPIAdapter(
+                    lambda: FakeConn(),
+                    kind="postgres",
+                    pool=pg_pool_ask,
+                    account="ask",
+                ),
+            }
+        )
+        lb_single = DBAPIAdapter(
+            lambda: FakeConn(),
+            kind="lakebase",
+            pool=lb_pool,
+        )
+
+        registry = MetricsRegistry(
+            adapters={"pg_report": pg_routed, "lb_ops": lb_single}
+        )
+
+        # /v1/select route allowlist
+        registry.record_request(
+            "/v1/select",
+            engine="pg_report",
+            status=200,
+            duration_seconds=0.012,
+        )
+
+        # Guardrail rejections (both record_guard_rejection and inc_guard_rejection + bounded enum)
+        registry.record_guard_rejection("filter_required")
+        registry.inc_guard_rejection("filter_required")
+        registry.record_guard_rejection("sort_not_indexed")
+        registry.record_guard_rejection("offset_too_large")
+        registry.record_guard_rejection("PLANTED_GUARD_SECRET_XYZ")
+
+        # Sync lag & discovery refresh
+        registry.set_sync_lag("pg_report", 12.5)
+        registry.set_sync_lag("lb_ops", 0.0)
+        registry.record_discovery_refresh("pg_report", "success")
+        registry.record_discovery_refresh("lb_ops", "error")
+        registry.record_discovery_refresh("lb_ops", "PLANTED_DISC_SECRET_XYZ")
+
+        # Lakebase cold-start & wake series
+        registry.record_lakebase_wake("lb_ops", "ok")
+        registry.record_lakebase_wake("lb_ops", "success")
+        registry.record_lakebase_wake("lb_ops", "timeout")
+        registry.record_lakebase_wake("lb_ops", "PLANTED_WAKE_SECRET_XYZ")
+        registry.record_lakebase_connect_retry("lb_ops")
+        registry.record_lakebase_connect_retry("lb_ops", 2)
+        registry.observe_lakebase_cold_start("lb_ops", 3.2)
+        registry.set_lakebase_state("lb_ops", "starting")
+
+        rendered = registry.render()
+
+        assert (
+            'seeknal_serving_requests_total{route="/v1/select",engine="pg_report",status="200"} 1'
+            in rendered
+        )
+
+        # Shared Postgres-wire pool gauges with {engine,kind,account}
+        assert (
+            'seeknal_serving_postgres_pool_in_use{engine="pg_report",kind="postgres",account="interactive"} 1'
+            in rendered
+        )
+        assert (
+            'seeknal_serving_postgres_pool_idle{engine="pg_report",kind="postgres",account="interactive"} 1'
+            in rendered
+        )
+        assert (
+            'seeknal_serving_postgres_pool_in_use{engine="pg_report",kind="postgres",account="bi"} 1'
+            in rendered
+        )
+        assert (
+            'seeknal_serving_postgres_pool_in_use{engine="pg_report",kind="postgres",account="ask"} 1'
+            in rendered
+        )
+        assert (
+            'seeknal_serving_postgres_pool_idle{engine="pg_report",kind="postgres",account="ask"} 0'
+            in rendered
+        )
+        assert (
+            'seeknal_serving_postgres_pool_in_use{engine="lb_ops",kind="lakebase",account="default"} 0'
+            in rendered
+        )
+        assert (
+            'seeknal_serving_postgres_pool_idle{engine="lb_ops",kind="lakebase",account="default"} 1'
+            in rendered
+        )
+
+        # Deprecated Lakebase pool duplicates still emitted
+        assert 'seeknal_serving_lakebase_pool_in_use{engine="pg_report"} 2' in rendered
+        assert 'seeknal_serving_lakebase_pool_idle{engine="pg_report"} 1' in rendered
+        assert 'seeknal_serving_lakebase_pool_in_use{engine="lb_ops"} 0' in rendered
+        assert 'seeknal_serving_lakebase_pool_idle{engine="lb_ops"} 1' in rendered
+
+        # Guard rejections
+        assert 'seeknal_serving_guard_rejections_total{code="filter_required"} 2' in rendered
+        assert 'seeknal_serving_guard_rejections_total{code="sort_not_indexed"} 1' in rendered
+        assert 'seeknal_serving_guard_rejections_total{code="offset_too_large"} 1' in rendered
+        assert 'seeknal_serving_guard_rejections_total{code="other"} 1' in rendered
+
+        # Sync lag & discovery refresh
+        assert 'seeknal_serving_sync_lag_seconds{engine="pg_report"} 12.5' in rendered
+        assert 'seeknal_serving_sync_lag_seconds{engine="lb_ops"} 0' in rendered
+        assert (
+            'seeknal_serving_discovery_refresh_total{engine="pg_report",outcome="success"} 1'
+            in rendered
+        )
+        assert (
+            'seeknal_serving_discovery_refresh_total{engine="lb_ops",outcome="error"} 2'
+            in rendered
+        )
+
+        # Lakebase wake, connect retries, cold start histogram, state gauge
+        assert 'seeknal_serving_lakebase_wake_total{engine="lb_ops",outcome="ok"} 1' in rendered
+        assert 'seeknal_serving_lakebase_wake_total{engine="lb_ops",outcome="success"} 1' in rendered
+        assert 'seeknal_serving_lakebase_wake_total{engine="lb_ops",outcome="timeout"} 1' in rendered
+        assert 'seeknal_serving_lakebase_wake_total{engine="lb_ops",outcome="error"} 1' in rendered
+        assert 'seeknal_serving_lakebase_connect_retries_total{engine="lb_ops"} 3' in rendered
+        assert 'seeknal_serving_lakebase_cold_start_seconds_bucket{engine="lb_ops",le="5.0"} 1' in rendered
+        assert 'seeknal_serving_lakebase_cold_start_seconds_count{engine="lb_ops"} 1' in rendered
+        assert 'seeknal_serving_lakebase_state{engine="lb_ops",state="ok"} 0' in rendered
+        assert 'seeknal_serving_lakebase_state{engine="lb_ops",state="starting"} 1' in rendered
+        assert 'seeknal_serving_lakebase_state{engine="lb_ops",state="unavailable"} 0' in rendered
+
+        for planted in (
+            "PLANTED_GUARD_SECRET_XYZ",
+            "PLANTED_DISC_SECRET_XYZ",
+            "PLANTED_WAKE_SECRET_XYZ",
+        ):
+            assert planted not in rendered
+
+        pg_pool_bi.release(c_bi_2, success=True)
+        pg_pool_ask.release(c_ask, success=True)
+    finally:
+        pg_pool_bi.close()
+        pg_pool_ask.close()
+        lb_pool.close()
+
+
+def test_readyz_reports_starting_for_lakebase_cold_start_connector():
+    from seeknal.serving.adapters import PostgresPool
+
+    class FakeColdStartConnector:
+        def __init__(self, state: str = "starting") -> None:
+            self.state = state
+
+    connector = FakeColdStartConnector("starting")
+
+    def connect_wrapper(**kwargs):
+        if connector.state == "starting":
+            raise ConnectionRefusedError("endpoint waking")
+        return MagicMock()
+
+    setattr(connect_wrapper, "cold_start_connector", connector)
+    pool = PostgresPool(connect_wrapper, pool_max=2)
+
+    try:
+        lb_adapter = DBAPIAdapter(connect_wrapper, kind="lakebase", pool=pool)
+        pg_adapter = DBAPIAdapter(lambda: MagicMock(), kind="postgres")
+
+        probe = ReadinessProbe(
+            {"pg_report": pg_adapter, "lb_ops": lb_adapter},
+            timeout_seconds=1.0,
+            cache_seconds=5.0,
+        )
+        ops_app = create_ops_app(readiness=probe)
+        client = TestClient(ops_app)
+
+        # 1. While connector.state == "starting", /readyz returns 503 with lb_ops: "starting"
+        r_starting = client.get("/readyz")
+        assert r_starting.status_code == 503
+        assert r_starting.json() == {
+            "ready": False,
+            "engines": {"pg_report": "ok", "lb_ops": "starting"},
+        }
+
+        # 2. Once connector transitions to "ok", /readyz transitions to 200 ok
+        connector.state = "ok"
+        r_ok = client.get("/readyz")
+        assert r_ok.status_code == 200
+        assert r_ok.json() == {
+            "ready": True,
+            "engines": {"pg_report": "ok", "lb_ops": "ok"},
+        }
+    finally:
+        pool.close()
+
+
+def test_b_m2_readyz_and_check_health_never_wake_suspended_lakebase_endpoint():
+    import httpx
+    from seeknal.serving.adapters import PostgresPool
+    from seeknal.serving.lakebase_endpoint import ColdStartConnector, parse_lakebase_block
+
+    http_wake_calls: list[str] = []
+    db_connect_calls = 0
+
+    def cp_handler(request: httpx.Request) -> httpx.Response:
+        http_wake_calls.append(f"{request.method} {request.url}")
+        return httpx.Response(202, json={"state": "starting"})
+
+    def suspended_db_connect(**kwargs):
+        nonlocal db_connect_calls
+        db_connect_calls += 1
+        raise ConnectionRefusedError("endpoint is suspended")
+
+    lb_cfg = parse_lakebase_block(
+        {
+            "project_id": "prj_0123456789abcdefghij",
+            "branch_id": "br_0123456789abcdefghij",
+            "endpoint_id": "ep_0123456789abcdefghij",
+            "endpoint_type": "read_write",
+            "cold_start": {
+                "wake": "api",
+                "api_url": "https://lakebase-cp.internal.example",
+                "api_token_env": "LB_CP_TOK",
+            },
+        }
+    )
+    connector = ColdStartConnector(
+        suspended_db_connect,
+        lb_cfg,
+        http_client=httpx.Client(transport=httpx.MockTransport(cp_handler)),
+        engine_name="lb_ops",
+        env={"LB_CP_TOK": "tok-secret"},
+    )
+
+    def wrapped_connect(**kw):
+        return connector.connect(**kw)
+
+    setattr(wrapped_connect, "cold_start_connector", connector)
+    pool = PostgresPool(wrapped_connect, pool_max=2)
+
+    try:
+        lb_adapter = DBAPIAdapter(
+            wrapped_connect,
+            kind="lakebase",
+            pool=pool,
+            lakebase_config=lb_cfg,
+            cold_start_connector=connector,
+        )
+        probe = ReadinessProbe(
+            {"lb_ops": lb_adapter},
+            timeout_seconds=1.0,
+            cache_seconds=0.0,
+        )
+        ops_app = create_ops_app(readiness=probe)
+        client = TestClient(ops_app)
+
+        # /readyz and check_health read connector.state only: ZERO DB connects and ZERO POST /start!
+        assert lb_adapter.check_health(timeout_seconds=1.0) is True
+        r1 = client.get("/readyz")
+        assert r1.status_code == 200
+        assert r1.json() == {"ready": True, "engines": {"lb_ops": "ok"}}
+        assert http_wake_calls == []
+        assert db_connect_calls == 0
+
+        # When connector is unavailable, /readyz returns 503 unavailable via at most one
+        # bounded plain connect per 5s without ever calling the wake API!
+        connector._state = "unavailable"
+        assert lb_adapter.check_health(timeout_seconds=1.0) is False
+        r2 = client.get("/readyz")
+        assert r2.status_code == 503
+        assert r2.json() == {"ready": False, "engines": {"lb_ops": "unavailable"}}
+        assert http_wake_calls == []
+        assert db_connect_calls == 1
+    finally:
+        pool.close()
+
+
+def test_b_m5_readyz_recovers_unavailable_lakebase_without_traffic_or_wake_api():
+    import httpx
+    from seeknal.serving.adapters import EngineError, PostgresPool
+    from seeknal.serving.lakebase_endpoint import ColdStartConnector, parse_lakebase_block
+
+    now_val = [1000.0]
+    post_start_calls = 0
+    plain_connect_calls = 0
+    db_up = False
+
+    def fake_clock() -> float:
+        return now_val[0]
+
+    def fake_sleep(sec: float) -> None:
+        now_val[0] += max(0.0, float(sec))
+
+    def cp_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_start_calls
+        if request.method == "POST" and request.url.path.endswith("/start"):
+            post_start_calls += 1
+        return httpx.Response(503, json={"error": "cp_down"})
+
+    def plain_db_connect(**kwargs):
+        nonlocal plain_connect_calls
+        plain_connect_calls += 1
+        if not db_up:
+            raise ConnectionRefusedError("db unreachable")
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value = cur
+        return conn
+
+    lb_cfg = parse_lakebase_block(
+        {
+            "project_id": "prj_0123456789abcdefghij",
+            "branch_id": "br_0123456789abcdefghij",
+            "endpoint_id": "ep_0123456789abcdefghij",
+            "endpoint_type": "read_write",
+            "cold_start": {
+                "wake": "api",
+                "api_url": "https://lakebase-cp.internal.example",
+                "api_token_env": "LB_CP_TOK",
+                "max_query_wait_seconds": 5.0,
+                "max_wake_seconds": 60.0,
+            },
+        }
+    )
+    metrics_reg = MetricsRegistry(allowed_engines=("lb_ops",))
+    connector = ColdStartConnector(
+        plain_db_connect,
+        lb_cfg,
+        metrics=metrics_reg,
+        http_client=httpx.Client(transport=httpx.MockTransport(cp_handler)),
+        engine_name="lb_ops",
+        env={"LB_CP_TOK": "tok-secret"},
+        clock=fake_clock,
+        sleep_fn=fake_sleep,
+    )
+
+    def wrapped_connect(**kw):
+        return connector.connect(**kw)
+
+    setattr(wrapped_connect, "cold_start_connector", connector)
+    pool = PostgresPool(wrapped_connect, pool_max=2)
+
+    try:
+        lb_adapter = DBAPIAdapter(
+            wrapped_connect,
+            kind="lakebase",
+            pool=pool,
+            lakebase_config=lb_cfg,
+            cold_start_connector=connector,
+        )
+        metrics_reg.register_adapters({"lb_ops": lb_adapter})
+        probe = ReadinessProbe(
+            {"lb_ops": lb_adapter},
+            timeout_seconds=1.0,
+            cache_seconds=0.0,
+            clock=fake_clock,
+        )
+        ops_app = create_ops_app(readiness=probe, metrics=metrics_reg)
+        client = TestClient(ops_app)
+
+        # 1. Initial failed wake transitions connector to "unavailable"
+        with pytest.raises(EngineError):
+            connector.connect()
+        assert connector.state == "unavailable"
+        assert post_start_calls == 1
+        connects_after_wake_fail = plain_connect_calls
+
+        # 2. No traffic; DB still down -> /readyz does 1 plain connect, rate-limited for 5s, ZERO wake calls
+        r_down_1 = client.get("/readyz")
+        assert r_down_1.status_code == 503
+        assert r_down_1.json() == {"ready": False, "engines": {"lb_ops": "unavailable"}}
+        assert plain_connect_calls == connects_after_wake_fail + 1
+        assert post_start_calls == 1
+
+        now_val[0] += 2.0
+        r_down_2 = client.get("/readyz")
+        assert r_down_2.status_code == 503
+        assert plain_connect_calls == connects_after_wake_fail + 1
+        assert post_start_calls == 1
+
+        # 3. DB comes back up; after 5s interval, /readyz alone recovers state to "ok" with ZERO wake API calls!
+        db_up = True
+        now_val[0] += 3.1
+        r_up = client.get("/readyz")
+        assert r_up.status_code == 200
+        assert r_up.json() == {"ready": True, "engines": {"lb_ops": "ok"}}
+        assert connector.state == "ok"
+        assert post_start_calls == 1
+        assert plain_connect_calls == connects_after_wake_fail + 2
+        assert 'seeknal_serving_lakebase_state{engine="lb_ops",state="ok"} 1' in metrics_reg.render()
+
+        # 4. Once state == "ok", /readyz no longer connects to DB
+        now_val[0] += 10.0
+        r_steady = client.get("/readyz")
+        assert r_steady.status_code == 200
+        assert plain_connect_calls == connects_after_wake_fail + 2
+        assert post_start_calls == 1
+    finally:
+        pool.close()
+
+
 
 
 

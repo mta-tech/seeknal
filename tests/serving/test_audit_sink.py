@@ -33,6 +33,7 @@ from seeknal.serving.adapters import DuckDBAdapter, EngineCancelled, QueryResult
 from seeknal.serving.audit import (
     ALLOWED_AUDIT_FIELD_SET,
     ALLOWED_AUDIT_FIELDS,
+    ALLOWED_AUDIT_ROUTES,
     AuditConfig,
     AuditManager,
     AuditRecord,
@@ -270,7 +271,8 @@ def test_value_level_scrubbing_and_strict_from_dict():
 
 
 def test_routes_and_error_code_behavior():
-    for valid_route in ("/v1/query", "/v1/explain", "/v1/cancel"):
+    assert "/v1/select" in ALLOWED_AUDIT_ROUTES
+    for valid_route in ("/v1/query", "/v1/select", "/v1/explain", "/v1/cancel"):
         ok_rec = AuditRecord(route=valid_route, status=200, code="ignored_on_200")
         assert ok_rec.code is None
 
@@ -1118,7 +1120,11 @@ def test_build_server_http_end_to_end_query_explain_cancel_and_rejected(tmp_path
         },
     }
 
-    handle = build_server(cfg_dict, connect_factories={"duck": lambda: con.cursor()})
+    handle = build_server(
+        cfg_dict,
+        connect_factories={"duck": lambda: con.cursor()},
+        cursor_key="test-audit-cursor-key-32-bytes-ok",
+    )
     assert isinstance(handle.audit_sink, FileAuditSink)
 
     query_sql = (
@@ -1380,8 +1386,10 @@ def test_cancel_202_emits_audit_record(tmp_path: Path):
 
 def test_build_server_and_cli_refuse_startup_on_unwritable_audit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ):
+    monkeypatch.setenv("SEEKNAL_CURSOR_KEY", "test-audit-cursor-key-32-bytes-ok")
     _, jwks_file, placement_file, schemas_file = _write_static_server_artifacts(tmp_path)
     unwritable_audit = tmp_path / "does_not_exist_dir" / "audit.jsonl"
 
@@ -2721,6 +2729,7 @@ def test_c_m3_cached_fd_rechecked_on_unlink_and_replace(tmp_path: Path):
 
         # 3) Replace with new regular file (e.g. external logrotate mv + create):
         #    next write detects st_ino mismatch, closes old fd, and appends to new file.
+        recreated_ino = os.lstat(audit_path).st_ino
         archived_path = audit_dir / "archived_external.jsonl"
         os.replace(audit_path, archived_path)
         replacement_tmp = audit_dir / "new_audit.tmp"
@@ -2728,7 +2737,7 @@ def test_c_m3_cached_fd_rechecked_on_unlink_and_replace(tmp_path: Path):
         os.chmod(replacement_tmp, 0o644)
         os.replace(replacement_tmp, audit_path)
         replaced_ino = os.lstat(audit_path).st_ino
-        assert replaced_ino != first_ino
+        assert replaced_ino != recreated_ino
 
         tok3 = _mint_grant(priv, sql, jti="jti-m3-after-replace")
         r3 = client.post(
@@ -3103,6 +3112,423 @@ async def test_c_n5_blackholed_audit_sink_isolates_threadpool_fails_fast_and_tri
     finally:
         unblock_sink.set()
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# 10. Multi-source Postgres / Lakebase / Select API §8 Audit Fields Tests
+# ---------------------------------------------------------------------------
+
+
+def test_run3_new_audit_fields_defaults_roundtrip_and_sanitization():
+    new_fields = (
+        "api",
+        "engine_kind",
+        "storage_class",
+        "account",
+        "lakebase_endpoint",
+        "cold_start",
+        "access_pattern",
+        "guard",
+        "filter_columns",
+        "effective_max_rows",
+        "paged",
+    )
+    for nf in new_fields:
+        assert nf in ALLOWED_AUDIT_FIELDS
+        assert nf in ALLOWED_AUDIT_FIELD_SET
+
+    # 1. Default values are always present in to_dict() and JSON as None
+    minimal = AuditRecord(route="/v1/select", status=200)
+    min_dict = minimal.to_dict()
+    assert set(min_dict.keys()) == ALLOWED_AUDIT_FIELD_SET
+    for nf in new_fields:
+        assert nf in min_dict
+        assert min_dict[nf] is None
+
+    # 2. Full population via build_audit_record and round-trip via AuditRecord.from_dict
+    rec = build_audit_record(
+        timestamp="2026-11-19T12:00:00Z",
+        route="/v1/select",
+        status=200,
+        elapsed_ms=8.5,
+        engine="lb_ops",
+        engine_kind="lakebase",
+        storage_class="object_storage",
+        account="interactive",
+        lakebase_endpoint={
+            "project_id": "prj_0123456789abcdefghij",
+            "branch_id": "br_0123456789abcdefghij",
+            "endpoint_id": "ep_0123456789abcdefghij",
+        },
+        cold_start={"woke": True, "wait_ms": 2450.5},
+        rule="filter",
+        access_pattern="filter",
+        guard="enforce",
+        filter_columns=["customer_id", "as_of_date", "customer_id"],
+        effective_max_rows=50,
+        paged=True,
+        tables=["ops.ops.ticket_events"],
+        row_count=10,
+        truncated=False,
+        claims={"jti": "jti-select-1", "sub": "user:analyst", "api": "select.v1"},
+        sql_sha256="a" * 64,
+    )
+    d = rec.to_dict()
+    assert d["route"] == "/v1/select"
+    assert d["api"] == "select.v1"
+    assert d["engine"] == "lb_ops"
+    assert d["engine_kind"] == "lakebase"
+    assert d["storage_class"] == "object_storage"
+    assert d["account"] == "interactive"
+    assert d["lakebase_endpoint"] == {
+        "project_id": "prj_0123456789abcdefghij",
+        "branch_id": "br_0123456789abcdefghij",
+        "endpoint_id": "ep_0123456789abcdefghij",
+    }
+    assert d["cold_start"] == {"woke": True, "wait_ms": 2450.5}
+    assert d["access_pattern"] == "filter"
+    assert d["guard"] == "enforce"
+    assert d["filter_columns"] == ["customer_id", "as_of_date"]
+    assert d["effective_max_rows"] == 50
+    assert d["paged"] is True
+
+    roundtripped = AuditRecord.from_dict(json.loads(rec.to_json_line()), strict=True)
+    assert roundtripped.to_dict() == d
+
+    # cold_start also accepts bool or non-negative number; lakebase_endpoint accepts string
+    rec_bool_cs = AuditRecord(
+        route="/v1/query",
+        status=200,
+        lakebase_endpoint="ep_0123456789abcdefghij",
+        cold_start=False,
+        effective_max_rows=0,
+        paged=False,
+    )
+    assert rec_bool_cs.lakebase_endpoint == "ep_0123456789abcdefghij"
+    assert rec_bool_cs.cold_start is False
+    assert rec_bool_cs.effective_max_rows == 0
+    assert rec_bool_cs.paged is False
+
+    rec_num_cs = AuditRecord(route="/v1/query", status=200, cold_start=3.125)
+    assert rec_num_cs.cold_start == 3.125
+
+    # 3. Secret scrubbing on string fields, lakebase_endpoint, cold_start, filter_columns
+    priv_key = ec.generate_private_key(ec.SECP256R1())
+    jwt_tok = sign_grant_token({"jti": "x", "sub": "u"}, priv_key, kid="k1")
+    dsn_str = "postgresql://svc:PLANTED_AUDIT_DSN_PW@pg.internal:5432/cbn"
+
+    scrubbed_rec = AuditRecord(
+        route="/v1/select",
+        status=422,
+        code="filter_required",
+        api=f"Bearer {jwt_tok}",
+        engine_kind=dsn_str,
+        storage_class=dsn_str,
+        account=f"Bearer {jwt_tok}",
+        access_pattern=dsn_str,
+        guard=f"Bearer {jwt_tok}",
+        lakebase_endpoint={"endpoint_id": dsn_str},
+        cold_start={"note": f"Bearer {jwt_tok}"},
+        filter_columns=["customer_id", f"Bearer {jwt_tok}"],
+    )
+    serialized = scrubbed_rec.to_json_line()
+    for secret in (jwt_tok, dsn_str, "PLANTED_AUDIT_DSN_PW"):
+        assert secret not in serialized
+
+    # 4. Type validation & filter_columns NEVER accepts mappings or filter values
+    with pytest.raises(ValueError, match="filter_columns"):
+        AuditRecord(
+            route="/v1/select",
+            status=200,
+            filter_columns={"customer_id": "C-SECRET-1001"},  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="filter_columns"):
+        AuditRecord(
+            route="/v1/select",
+            status=200,
+            filter_columns=["customer_id='C-SECRET-1001'"],
+        )
+    with pytest.raises(ValueError, match="filter_columns"):
+        AuditRecord(
+            route="/v1/select",
+            status=200,
+            filter_columns="customer_id",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="effective_max_rows"):
+        AuditRecord(route="/v1/select", status=200, effective_max_rows=True)
+    with pytest.raises(ValueError, match="effective_max_rows"):
+        AuditRecord(route="/v1/select", status=200, effective_max_rows=-1)
+    with pytest.raises(ValueError, match="paged"):
+        AuditRecord(route="/v1/select", status=200, paged="yes")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="lakebase_endpoint"):
+        AuditRecord(route="/v1/select", status=200, lakebase_endpoint={"dsn": dsn_str})
+    with pytest.raises(ValueError, match="cold_start"):
+        AuditRecord(route="/v1/select", status=200, cold_start={"token": "secret"})
+
+
+def test_http_run3_audit_fields_across_query_explain_select_and_guardrail_rejection(
+    tmp_path: Path,
+) -> None:
+    """Verify HTTP /v1/query, /v1/explain, and /v1/select emit all Run 3 audit fields."""
+    from seeknal.serving.adapters import QueryResult, WorkloadRoutedAdapter
+
+    priv = ec.generate_private_key(ec.SECP256R1())
+    pub = priv.public_key()
+    placement = Placement.from_dict(
+        {
+            "engines": {
+                "lb_ops": {"kind": "lakebase", "dialect": "postgres"},
+            },
+            "tables": {
+                "cbn.rpt.txns": {
+                    "keys": ["txn_id"],
+                    "row_count": 500_000,
+                    "serve": {"lb_ops": "rpt.txns"},
+                    "access": {
+                        "pattern": "filter",
+                        "keys": ["txn_id"],
+                        "filterable": ["customer_id", "as_of_date"],
+                        "sortable": ["as_of_date", "txn_id"],
+                        "max_rows": 50,
+                    },
+                }
+            },
+        }
+    )
+    schemas = {"cbn.rpt.txns": ["txn_id", "customer_id", "as_of_date", "amount"]}
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys={"k1": pub},
+        default_catalog="cbn",
+    )
+
+    class FakeLakebaseSubAdapter:
+        storage_class = "object_storage"
+        account = "interactive"
+        lakebase_endpoint = {
+            "project_id": "prj_test01",
+            "branch_id": "br_main01",
+            "endpoint_id": "ep_rw01",
+        }
+        last_cold_start = False
+
+        def execute(self, prepared: Any, *, timeout_seconds: float, **kwargs: Any) -> QueryResult:
+            res = QueryResult(
+                columns=("txn_id", "amount", "as_of_date"),
+                column_types=("INT", "INT", "TEXT"),
+                rows=[(101, 500, "2026-10-01"), (102, 600, "2026-10-02"), (103, 700, "2026-10-03")],
+                truncated=True,
+                elapsed_ms=4.25,
+                engine=prepared.engine,
+            )
+            object.__setattr__(res, "cold_start", True)
+            return res
+
+        def cancel(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    routed_adapter = WorkloadRoutedAdapter(
+        by_workload={"interactive": FakeLakebaseSubAdapter()}
+    )
+
+    audit_file = tmp_path / "run3_http_audit.jsonl"
+    mgr = FileAuditSink(audit_file, fsync=False)
+    callable_records: list[dict[str, Any]] = []
+
+    tables_grant = {
+        "cbn.rpt.txns": {
+            "columns": ["txn_id", "customer_id", "as_of_date", "amount"],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        }
+    }
+
+    def _mint(raw_input: str | bytes, jti: str, *, api: str | None = None) -> str:
+        now = time.time()
+        digest = (
+            hashlib.sha256(raw_input).hexdigest()
+            if isinstance(raw_input, bytes)
+            else hashlib.sha256(raw_input.encode("utf-8")).hexdigest()
+        )
+        claims: dict[str, Any] = {
+            "sub": "user:analyst",
+            "ws": "cbn",
+            "jti": jti,
+            "iss": "atlas-catalog",
+            "aud": "seeknal-serving",
+            "iat": now,
+            "exp": now + 120.0,
+            "sql_sha256": digest,
+            "sql_dialect": "postgres",
+            "workload": "interactive",
+            "max_rows": 200,
+            "tables": tables_grant,
+        }
+        if api is not None:
+            claims["api"] = api
+        return sign_grant_token(claims, priv, kid="k1")
+
+    try:
+        client = TestClient(
+            create_app(
+                pipeline,
+                {"lb_ops": routed_adapter},
+                audit_sink=mgr,
+                cursor_key="run3-audit-cursor-secret-32-bytes-ok",
+            )
+        )
+
+        # 1. /v1/query 200 OK
+        q_sql = "SELECT txn_id, amount, as_of_date FROM cbn.rpt.txns WHERE customer_id = 'C-1'"
+        r_q = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {_mint(q_sql, 'jti-r3-q1')}"},
+            json={"sql": q_sql},
+        )
+        assert r_q.status_code == 200
+
+        # 2. /v1/explain 200 OK
+        r_ex = client.post(
+            "/v1/explain",
+            headers={"Authorization": f"Bearer {_mint(q_sql, 'jti-r3-ex1')}"},
+            json={"sql": q_sql},
+        )
+        assert r_ex.status_code == 200
+
+        # 3. /v1/select 200 OK (with keyset truncation -> paged=True)
+        sel_raw = json.dumps(
+            {
+                "table": "cbn.rpt.txns",
+                "columns": ["txn_id", "amount"],
+                "where": {"customer_id": {"_eq": "C-1"}},
+                "order_by": [{"as_of_date": "desc"}],
+                "limit": 2,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        r_sel = client.post(
+            "/v1/select",
+            headers={"Authorization": f"Bearer {_mint(sel_raw, 'jti-r3-sel1', api='select.v1')}"},
+            content=sel_raw,
+        )
+        assert r_sel.status_code == 200
+
+        # 4. /v1/select 422 guardrail rejection (filter_required -> guard='reject')
+        bad_sel_raw = json.dumps(
+            {"table": "cbn.rpt.txns", "columns": ["txn_id"]},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        r_rej = client.post(
+            "/v1/select",
+            headers={"Authorization": f"Bearer {_mint(bad_sel_raw, 'jti-r3-rej1', api='select.v1')}"},
+            content=bad_sel_raw,
+        )
+        assert r_rej.status_code == 422
+        assert r_rej.json()["code"] == "filter_required"
+    finally:
+        mgr.close()
+
+    emitted = [json.loads(line) for line in audit_file.read_text("utf-8").splitlines()]
+    assert len(emitted) == 4
+    q_rec, ex_rec, sel_rec, rej_rec = emitted
+
+    assert q_rec["route"] == "/v1/query"
+    assert q_rec["api"] is None
+    assert q_rec["engine"] == "lb_ops"
+    assert q_rec["engine_kind"] == "lakebase"
+    assert q_rec["storage_class"] == "object_storage"
+    assert q_rec["account"] == "interactive"
+    assert q_rec["lakebase_endpoint"] == {
+        "project_id": "prj_test01",
+        "branch_id": "br_main01",
+        "endpoint_id": "ep_rw01",
+    }
+    assert q_rec["cold_start"] is True
+    assert q_rec["access_pattern"] == "filter"
+    assert q_rec["guard"] == "pass"
+    assert q_rec["filter_columns"] == ["customer_id"]
+    assert q_rec["effective_max_rows"] == 50
+    assert q_rec["paged"] is None
+
+    assert ex_rec["route"] == "/v1/explain"
+    assert ex_rec["engine_kind"] == "lakebase"
+    assert ex_rec["storage_class"] == "object_storage"
+    assert ex_rec["account"] == "interactive"
+    assert ex_rec["cold_start"] is None
+    assert ex_rec["access_pattern"] == "filter"
+    assert ex_rec["guard"] == "pass"
+    assert ex_rec["filter_columns"] == ["customer_id"]
+    assert ex_rec["effective_max_rows"] == 50
+
+    assert sel_rec["route"] == "/v1/select"
+    assert sel_rec["api"] == "select.v1"
+    assert sel_rec["engine"] == "lb_ops"
+    assert sel_rec["engine_kind"] == "lakebase"
+    assert sel_rec["storage_class"] == "object_storage"
+    assert sel_rec["account"] == "interactive"
+    assert sel_rec["lakebase_endpoint"]["endpoint_id"] == "ep_rw01"
+    assert sel_rec["cold_start"] is True
+    assert sel_rec["access_pattern"] == "filter"
+    assert sel_rec["guard"] == "pass"
+    assert sel_rec["filter_columns"] == ["customer_id"]
+    assert sel_rec["effective_max_rows"] == 2
+    assert sel_rec["paged"] is True
+
+    assert rej_rec["route"] == "/v1/select"
+    assert rej_rec["status"] == 422
+    assert rej_rec["code"] == "filter_required"
+    assert rej_rec["api"] == "select.v1"
+    assert rej_rec["engine"] == "lb_ops"
+    assert rej_rec["engine_kind"] == "lakebase"
+    assert rej_rec["storage_class"] == "object_storage"
+    assert rej_rec["account"] == "interactive"
+    assert rej_rec["access_pattern"] == "filter"
+    assert rej_rec["guard"] == "reject"
+    assert rej_rec["effective_max_rows"] == 50
+    assert rej_rec["paged"] is False
+
+    # 5. Also verify callable audit_sink pre-execution records populate Run 3 fields
+    client_cb = TestClient(
+        create_app(
+            pipeline,
+            {"lb_ops": routed_adapter},
+            audit_sink=callable_records.append,
+            cursor_key="run3-audit-cursor-secret-32-bytes-ok",
+        )
+    )
+    r_cb_q = client_cb.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {_mint(q_sql, 'jti-r3-cb-q1')}"},
+        json={"sql": q_sql},
+    )
+    assert r_cb_q.status_code == 200
+    r_cb_sel = client_cb.post(
+        "/v1/select",
+        headers={"Authorization": f"Bearer {_mint(sel_raw, 'jti-r3-cb-sel1', api='select.v1')}"},
+        content=sel_raw,
+    )
+    assert r_cb_sel.status_code == 200
+    assert len(callable_records) == 2
+    assert callable_records[0]["engine_kind"] == "lakebase"
+    assert callable_records[0]["storage_class"] == "object_storage"
+    assert callable_records[0]["account"] == "interactive"
+    assert callable_records[0]["cold_start"] is False
+    assert callable_records[0]["access_pattern"] == "filter"
+    assert callable_records[0]["guard"] == "pass"
+    assert callable_records[0]["filter_columns"] == ["customer_id"]
+    assert callable_records[0]["effective_max_rows"] == 50
+    assert callable_records[1]["api"] == "select.v1"
+    assert callable_records[1]["engine_kind"] == "lakebase"
+    assert callable_records[1]["storage_class"] == "object_storage"
+    assert callable_records[1]["access_pattern"] == "filter"
+    assert callable_records[1]["guard"] == "pass"
+    assert callable_records[1]["filter_columns"] == ["customer_id"]
+    assert callable_records[1]["effective_max_rows"] == 2
+    assert callable_records[1]["paged"] is False
+
+
 
 
 

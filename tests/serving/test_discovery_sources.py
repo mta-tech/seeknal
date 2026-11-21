@@ -424,3 +424,141 @@ def test_lakebase_sync_state_and_db_error():
     conn.commit()
     with pytest.raises(DiscoveryError, match="Failed to query Lakebase sync state"):
         src.read_state()
+
+
+def test_lakebase_sync_source_qualified_table_and_identifier_validation():
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog
+
+    cat = FakePostgresCatalog()
+    cat.add_sync_state(
+        "rpt.daily",
+        snapshot_id=777,
+        synced_at=datetime(2026, 11, 19, 10, 0, 0, tzinfo=timezone.utc),
+    )
+    cat.add_sync_state(
+        "stg.orders",
+        snapshot_id=888,
+        synced_at="2026-11-19T11:30:00Z",
+        table_name="stg._lakebase_sync_state",
+    )
+
+    # Default queries qualified public._lakebase_sync_state
+    src_default = LakebaseSyncSource(cat.connect)
+    st_default = src_default.read_state()
+    assert st_default["rpt.daily"].snapshot_id == 777
+    assert any(
+        sql == "SELECT target_table, snapshot_id, synced_at FROM public._lakebase_sync_state"
+        for sql, _ in cat.executed
+    )
+
+    # Custom schema-qualified sync_state_table
+    src_custom = LakebaseSyncSource(
+        cat.connect, sync_state_table="stg._lakebase_sync_state"
+    )
+    st_custom = src_custom.read_state()
+    assert st_custom["stg.orders"].snapshot_id == 888
+
+    # Invalid sync_state_table identifiers rejected with DiscoveryConfigError
+    for bad_tbl in (
+        "",
+        "Public._lakebase_sync_state",
+        "a.b.c",
+        "public._lakebase_sync_state; DROP TABLE x",
+        "public._lakebase_sync_state\n",
+        "1bad.tbl",
+    ):
+        with pytest.raises(DiscoveryConfigError):
+            LakebaseSyncSource(cat.connect, sync_state_table=bad_tbl)
+
+
+def test_discovery_config_postgres_sources_and_policy_validation():
+    # Defaults: lakebase gets public._lakebase_sync_state; postgres gets None
+    cfg = DiscoveryConfig.from_dict(
+        {
+            "default_catalog": "cbn",
+            "engines": {
+                "pg_report": {"kind": "postgres", "dialect": "postgres"},
+                "lb_ops": {"kind": "lakebase", "dialect": "postgres"},
+            },
+            "postgres_sources": {
+                "pg_report": {
+                    "schemas": {"rpt": {"include": ["rpt_*"], "exclude": ["*_tmp"]}},
+                },
+                "lb_ops": {
+                    "account": "ask",
+                    "logical_catalog": "ops",
+                    "schema_map": {"phys_ops": "ops"},
+                    "schemas": {"phys_ops": {"tokenized": True}},
+                },
+            },
+            "policy": {
+                "require_filter_min_rows": 50_000,
+                "max_in_list": 500,
+                "max_offset": 5_000,
+                "guard_mode": "warn",
+                "pii_object_storage_engines": ["lb_ops"],
+            },
+        }
+    )
+
+    pg_src = cfg.postgres_sources["pg_report"]
+    assert pg_src.account == "interactive"
+    assert pg_src.logical_catalog == "pg_report"
+    assert pg_src.freshness is not None
+    assert pg_src.freshness.sync_state_table is None
+
+    lb_src = cfg.postgres_sources["lb_ops"]
+    assert lb_src.account == "ask"
+    assert lb_src.logical_catalog == "ops"
+    assert dict(lb_src.schema_map) == {"phys_ops": "ops"}
+    assert lb_src.freshness is not None
+    assert lb_src.freshness.sync_state_table == "public._lakebase_sync_state"
+    assert lb_src.schemas["phys_ops"].tokenized is True
+
+    assert cfg.require_filter_min_rows == 50_000
+    assert cfg.max_in_list == 500
+    assert cfg.max_offset == 5_000
+    assert cfg.guard_mode == "warn"
+    assert cfg.pii_object_storage_engines == ("lb_ops",)
+
+    # Reject non-postgres/lakebase engine in postgres_sources
+    with pytest.raises(DiscoveryConfigError, match="kind 'postgres' or 'lakebase'"):
+        DiscoveryConfig.from_dict(
+            {
+                "default_catalog": "cbn",
+                "engines": {"sr": {"kind": "starrocks", "dialect": "starrocks"}},
+                "postgres_sources": {"sr": {"schemas": {"rpt": {}}}},
+            }
+        )
+
+    # Reject invalid account
+    with pytest.raises(DiscoveryConfigError, match="account"):
+        DiscoveryConfig.from_dict(
+            {
+                "default_catalog": "cbn",
+                "engines": {"pg": {"kind": "postgres", "dialect": "postgres"}},
+                "postgres_sources": {
+                    "pg": {"account": "superuser", "schemas": {"rpt": {}}}
+                },
+            }
+        )
+
+    # Reject empty schemas
+    with pytest.raises(DiscoveryConfigError, match="schemas"):
+        DiscoveryConfig.from_dict(
+            {
+                "default_catalog": "cbn",
+                "engines": {"pg": {"kind": "postgres", "dialect": "postgres"}},
+                "postgres_sources": {"pg": {"schemas": {}}},
+            }
+        )
+
+    # Reject invalid guard_mode
+    with pytest.raises(DiscoveryConfigError, match="guard_mode"):
+        DiscoveryConfig.from_dict(
+            {
+                "default_catalog": "cbn",
+                "policy": {"guard_mode": "off"},
+            }
+        )
+

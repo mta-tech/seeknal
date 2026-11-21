@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_AUDIT_ROUTES: tuple[str, ...] = (
     "/v1/query",
+    "/v1/select",
     "/v1/explain",
     "/v1/cancel",
 )
@@ -53,8 +54,19 @@ ALLOWED_AUDIT_FIELDS: tuple[str, ...] = (
     "workload",
     "origin",
     "route",
+    "api",
     "engine",
+    "engine_kind",
+    "storage_class",
+    "account",
+    "lakebase_endpoint",
+    "cold_start",
     "rule",
+    "access_pattern",
+    "guard",
+    "filter_columns",
+    "effective_max_rows",
+    "paged",
     "tables",
     "status",
     "code",
@@ -339,6 +351,141 @@ def _normalize_sql_sha256(
     return sql_sha256.lower()
 
 
+def _normalize_filter_columns(
+    filter_columns: Iterable[str] | None,
+) -> list[str] | None:
+    """Normalize filter_columns to a list of scrubbed column name strings or None (never values)."""
+    if filter_columns is None:
+        return None
+    if isinstance(filter_columns, (str, bytes)):
+        raise ValueError(
+            "Audit field 'filter_columns' must be a sequence of column name strings, not a string"
+        )
+    if isinstance(filter_columns, Mapping):
+        raise ValueError(
+            "Audit field 'filter_columns' must be a sequence of column name strings, not a mapping (values are forbidden)"
+        )
+    if not isinstance(filter_columns, Iterable):
+        raise ValueError("Audit field 'filter_columns' must be an iterable of column name strings or None")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in filter_columns:
+        if not isinstance(item, str):
+            raise ValueError("Each entry in audit 'filter_columns' must be a column name string")
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        cleaned = _scrub_secret_patterns(cleaned)
+        if any(ch in cleaned for ch in ("=", "'", '"', ";", "\n", "\r")):
+            raise ValueError(
+                "Audit field 'filter_columns' must contain column names only, never filter expressions or values"
+            )
+        cleaned = cleaned[:_MAX_AUDIT_TABLE_NAME_LEN]
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        out.append(cleaned)
+    return out[:_MAX_AUDIT_TABLES]
+
+
+def _normalize_lakebase_endpoint(
+    value: Any,
+) -> dict[str, str] | str | None:
+    """Normalize lakebase_endpoint to a dict of scrubbed string IDs, a scrubbed string, or None."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _scrub_secret_patterns(value)
+    if (
+        not isinstance(value, Mapping)
+        and hasattr(value, "project_id")
+        and hasattr(value, "endpoint_id")
+    ):
+        extracted: dict[str, Any] = {
+            "project_id": getattr(value, "project_id", None),
+            "branch_id": getattr(value, "branch_id", None),
+            "endpoint_id": getattr(value, "endpoint_id", None),
+        }
+        value = {k: v for k, v in extracted.items() if v is not None}
+    if isinstance(value, Mapping):
+        out: dict[str, str] = {}
+        for k, v in value.items():
+            if not isinstance(k, str) or not k.strip():
+                raise ValueError("Audit field 'lakebase_endpoint' dict keys must be non-empty strings")
+            k_clean = k.strip()
+            if k_clean.lower() in FORBIDDEN_AUDIT_KEYS:
+                raise ValueError(
+                    f"Forbidden key '{_safe_config_key_label(k_clean)}' in audit field 'lakebase_endpoint'"
+                )
+            if not isinstance(v, str):
+                raise ValueError("Audit field 'lakebase_endpoint' dict values must be strings")
+            out[_scrub_secret_patterns(k_clean)] = _scrub_secret_patterns(v)
+        return out
+    raise ValueError(
+        "Audit field 'lakebase_endpoint' must be a dict of string IDs, a string, or None"
+    )
+
+
+def _normalize_cold_start(
+    value: Any,
+) -> bool | int | float | dict[str, Any] | None:
+    """Normalize cold_start to a bool, finite number, scrubbed flat dict, or None."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        fval = float(value)
+        if not math.isfinite(fval) or fval < 0.0:
+            raise ValueError("Audit field 'cold_start' numeric value must be finite and non-negative")
+        return value if isinstance(value, int) else round(fval, 4)
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if not isinstance(k, str) or not k.strip():
+                raise ValueError("Audit field 'cold_start' dict keys must be non-empty strings")
+            k_clean = k.strip()
+            if k_clean.lower() in FORBIDDEN_AUDIT_KEYS:
+                raise ValueError(
+                    f"Forbidden key '{_safe_config_key_label(k_clean)}' in audit field 'cold_start'"
+                )
+            k_safe = _scrub_secret_patterns(k_clean)
+            if v is None or isinstance(v, bool):
+                out[k_safe] = v
+            elif isinstance(v, (int, float)):
+                fv = float(v)
+                if not math.isfinite(fv) or fv < 0.0:
+                    raise ValueError(
+                        "Audit field 'cold_start' dict numeric values must be finite and non-negative"
+                    )
+                out[k_safe] = v if isinstance(v, int) else round(fv, 4)
+            elif isinstance(v, str):
+                out[k_safe] = _scrub_secret_patterns(v)
+            else:
+                raise ValueError(
+                    "Audit field 'cold_start' dict values must be bool, finite number, string, or None"
+                )
+        return out
+    raise ValueError("Audit field 'cold_start' must be a bool, dict, non-negative number, or None")
+
+
+def _normalize_effective_max_rows(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("Audit field 'effective_max_rows' must be a non-negative int or None")
+    return value
+
+
+def _normalize_paged(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError("Audit field 'paged' must be a bool or None")
+    return value
+
+
 @dataclass(init=False)
 class AuditRecord:
     """Strictly allowlisted structured audit record for a single Serving request."""
@@ -352,8 +499,19 @@ class AuditRecord:
     workload: str | None
     origin: str | None
     route: str
+    api: str | None
     engine: str | None
+    engine_kind: str | None
+    storage_class: str | None
+    account: str | None
+    lakebase_endpoint: dict[str, str] | str | None
+    cold_start: bool | int | float | dict[str, Any] | None
     rule: str | None
+    access_pattern: str | None
+    guard: str | None
+    filter_columns: list[str] | None
+    effective_max_rows: int | None
+    paged: bool | None
     tables: list[str]
     status: int
     code: str | None
@@ -379,8 +537,19 @@ class AuditRecord:
         azp: str | None = None,
         workload: str | None = None,
         origin: str | None = None,
+        api: str | None = None,
         engine: str | None = None,
+        engine_kind: str | None = None,
+        storage_class: str | None = None,
+        account: str | None = None,
+        lakebase_endpoint: Mapping[str, str] | str | Any = None,
+        cold_start: bool | int | float | Mapping[str, Any] | None = None,
         rule: str | None = None,
+        access_pattern: str | None = None,
+        guard: str | None = None,
+        filter_columns: Iterable[str] | None = None,
+        effective_max_rows: int | None = None,
+        paged: bool | None = None,
         tables: Sequence[str] | None = None,
         logical_tables: Sequence[str] | None = None,
         code: str | None = None,
@@ -445,8 +614,19 @@ class AuditRecord:
         self.workload = _normalize_optional_str(workload, "workload")
         self.origin = _normalize_optional_str(origin, "origin")
         self.route = route
+        self.api = _normalize_optional_str(api, "api")
         self.engine = _normalize_optional_str(engine, "engine")
+        self.engine_kind = _normalize_optional_str(engine_kind, "engine_kind")
+        self.storage_class = _normalize_optional_str(storage_class, "storage_class")
+        self.account = _normalize_optional_str(account, "account")
+        self.lakebase_endpoint = _normalize_lakebase_endpoint(lakebase_endpoint)
+        self.cold_start = _normalize_cold_start(cold_start)
         self.rule = _normalize_optional_str(rule, "rule")
+        self.access_pattern = _normalize_optional_str(access_pattern, "access_pattern")
+        self.guard = _normalize_optional_str(guard, "guard")
+        self.filter_columns = _normalize_filter_columns(filter_columns)
+        self.effective_max_rows = _normalize_effective_max_rows(effective_max_rows)
+        self.paged = _normalize_paged(paged)
         self.tables = _normalize_tables(tables, logical_tables)
         self.status = status
         self.code = resolved_code
@@ -470,6 +650,16 @@ class AuditRecord:
             val = getattr(self, key)
             if key == "tables":
                 out[key] = _normalize_tables(val)
+            elif key == "filter_columns":
+                out[key] = _normalize_filter_columns(val)
+            elif key == "lakebase_endpoint":
+                out[key] = _normalize_lakebase_endpoint(val)
+            elif key == "cold_start":
+                out[key] = _normalize_cold_start(val)
+            elif key == "effective_max_rows":
+                out[key] = _normalize_effective_max_rows(val)
+            elif key == "paged":
+                out[key] = _normalize_paged(val)
             elif isinstance(val, str) and key not in ("timestamp", "route", "sql_sha256"):
                 out[key] = _scrub_secret_patterns(val)
             elif isinstance(val, str):
@@ -528,8 +718,19 @@ class AuditRecord:
             workload=data.get("workload"),
             origin=data.get("origin"),
             route=data["route"],
+            api=data.get("api"),
             engine=data.get("engine"),
+            engine_kind=data.get("engine_kind"),
+            storage_class=data.get("storage_class"),
+            account=data.get("account"),
+            lakebase_endpoint=data.get("lakebase_endpoint"),
+            cold_start=data.get("cold_start"),
             rule=data.get("rule"),
+            access_pattern=data.get("access_pattern"),
+            guard=data.get("guard"),
+            filter_columns=data.get("filter_columns"),
+            effective_max_rows=data.get("effective_max_rows"),
+            paged=data.get("paged"),
             tables=data.get("tables"),
             logical_tables=data.get("logical_tables"),
             status=data["status"],
@@ -561,8 +762,19 @@ def build_audit_record(
     azp: str | None = None,
     workload: str | None = None,
     origin: str | None = None,
+    api: str | None = None,
     engine: str | None = None,
+    engine_kind: str | None = None,
+    storage_class: str | None = None,
+    account: str | None = None,
+    lakebase_endpoint: Mapping[str, str] | str | Any = None,
+    cold_start: bool | int | float | Mapping[str, Any] | None = None,
     rule: str | None = None,
+    access_pattern: str | None = None,
+    guard: str | None = None,
+    filter_columns: Iterable[str] | None = None,
+    effective_max_rows: int | None = None,
+    paged: bool | None = None,
     tables: Sequence[str] | None = None,
     logical_tables: Sequence[str] | None = None,
     code: str | None = None,
@@ -607,6 +819,8 @@ def build_audit_record(
             audit_id = claims["jti"]
         if subject is None and isinstance(claims.get("sub"), str):
             subject = claims["sub"]
+        if api is None and isinstance(claims.get("api"), str):
+            api = claims["api"]
         act = claims.get("act")
         if isinstance(act, Mapping):
             if act_sub is None and isinstance(act.get("sub"), str):
@@ -644,8 +858,19 @@ def build_audit_record(
         workload=workload,
         origin=origin,
         route=route,
+        api=api,
         engine=engine,
+        engine_kind=engine_kind,
+        storage_class=storage_class,
+        account=account,
+        lakebase_endpoint=lakebase_endpoint,
+        cold_start=cold_start,
         rule=rule,
+        access_pattern=access_pattern,
+        guard=guard,
+        filter_columns=filter_columns,
+        effective_max_rows=effective_max_rows,
+        paged=paged,
         tables=tables,
         logical_tables=logical_tables,
         status=status,
@@ -671,6 +896,16 @@ def _validate_record_dict(raw_dict: Mapping[str, Any]) -> dict[str, Any]:
         val = raw_dict[key]
         if key == "tables":
             val = _normalize_tables(val)
+        elif key == "filter_columns":
+            val = _normalize_filter_columns(val)
+        elif key == "lakebase_endpoint":
+            val = _normalize_lakebase_endpoint(val)
+        elif key == "cold_start":
+            val = _normalize_cold_start(val)
+        elif key == "effective_max_rows":
+            val = _normalize_effective_max_rows(val)
+        elif key == "paged":
+            val = _normalize_paged(val)
         elif isinstance(val, str):
             if key in ("timestamp", "route", "sql_sha256"):
                 val = _sanitize_surrogates(val)

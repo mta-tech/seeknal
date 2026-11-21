@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlglot
 
-from seeknal.serving.features import extract_features
+from seeknal.serving.features import OrderByItem, PredicateFeature, extract_features
 
 
 def _parse_and_extract(sql: str, dialect: str = "postgres"):
@@ -49,6 +49,13 @@ def test_statement_kinds():
     assert (
         _parse_and_extract("SET search_path TO public").kind == "other"
     )
+    for dml_cte_sql in (
+        "WITH i AS (INSERT INTO claims.claim (claim_id, amount) VALUES (999, 1) RETURNING 1 AS x) SELECT 1 AS one",
+        "WITH i AS (INSERT INTO claims.claim (claim_id) SELECT 5 RETURNING 1 AS x) SELECT count(*) AS n FROM i",
+        "WITH u AS (UPDATE claims.claim SET amount = 0 WHERE claim_id = 1 RETURNING claim_id) SELECT * FROM u",
+        "WITH d AS (DELETE FROM claims.claim WHERE claim_id = 1 RETURNING claim_id) SELECT * FROM d",
+    ):
+        assert _parse_and_extract(dml_cte_sql).kind == "other"
 
 
 def test_extract_tables_and_cte_exclusion():
@@ -177,3 +184,133 @@ def test_key_equalities():
         "SELECT * FROM claims.claim WHERE lower(claim_id) = 'abc'"
     )
     assert f11.key_equalities == {}
+
+
+def test_sargable_predicates_extraction():
+    # eq, in, range, between, prefix_like, and single-column OR
+    f = _parse_and_extract(
+        "SELECT * FROM rpt.txn t "
+        "WHERE t.customer_id = $1 "
+        "AND branch_code IN ('B1', 'B2', 'B3') "
+        "AND t.as_of_date >= '2026-10-01' "
+        "AND amount BETWEEN 100 AND 500 "
+        "AND merchant_code LIKE 'MRC\\%01%' "
+        "AND (status = 'OK' OR status IN ('SETTLED', 'DONE'))"
+    )
+    assert f.predicates == (
+        PredicateFeature(
+            column="customer_id", op="eq", value_count=1, table_qualifier="t"
+        ),
+        PredicateFeature(
+            column="branch_code", op="in", value_count=3, table_qualifier=None
+        ),
+        PredicateFeature(
+            column="as_of_date", op="range", value_count=1, table_qualifier="t"
+        ),
+        PredicateFeature(
+            column="amount", op="between", value_count=2, table_qualifier=None
+        ),
+        PredicateFeature(
+            column="merchant_code",
+            op="prefix_like",
+            value_count=1,
+            table_qualifier=None,
+        ),
+        PredicateFeature(
+            column="status", op="or_eq", value_count=3, table_qualifier=None
+        ),
+    )
+
+
+def test_disqualified_non_sargable_predicates():
+    # Wrapped columns (CAST, ::text, lower), IS [NOT] NULL, = NULL, bad LIKE, mixed OR
+    for sql in (
+        "SELECT * FROM t WHERE CAST(id AS text) = '1'",
+        "SELECT * FROM t WHERE id::text = '1'",
+        "SELECT * FROM t WHERE lower(id) = 'x'",
+        "SELECT * FROM t WHERE id IS NULL",
+        "SELECT * FROM t WHERE id IS NOT NULL",
+        "SELECT * FROM t WHERE id = NULL",
+        "SELECT * FROM t WHERE id = 1 OR true",
+        "SELECT * FROM t WHERE id = 1 OR other = 2",
+        "SELECT * FROM t WHERE name LIKE '%abc'",
+        "SELECT * FROM t WHERE name LIKE 'a_b%'",
+        "SELECT * FROM t WHERE name LIKE '%'",
+        "SELECT * FROM t WHERE name ILIKE 'abc%'",
+    ):
+        f = _parse_and_extract(sql)
+        assert f.predicates == (), f"Expected empty predicates for: {sql}"
+
+
+def test_offset_and_order_by_extraction():
+    f1 = _parse_and_extract(
+        "SELECT * FROM t ORDER BY t.as_of_date DESC, txn_id ASC, lower(name), 1 LIMIT 50 OFFSET 250"
+    )
+    assert f1.offset == 250
+    assert f1.order_by == (
+        OrderByItem(
+            column="as_of_date",
+            direction="desc",
+            table_qualifier="t",
+            is_bare_column=True,
+        ),
+        OrderByItem(
+            column="txn_id",
+            direction="asc",
+            table_qualifier=None,
+            is_bare_column=True,
+        ),
+        OrderByItem(
+            column=None,
+            direction="asc",
+            table_qualifier=None,
+            is_bare_column=False,
+        ),
+        OrderByItem(
+            column=None,
+            direction="asc",
+            table_qualifier=None,
+            is_bare_column=False,
+        ),
+    )
+
+    f_neg = _parse_and_extract("SELECT * FROM t OFFSET -5")
+    assert f_neg.offset == -5
+
+
+def test_parameterised_prefix_like_extraction():
+    stmt = sqlglot.parse_one(
+        "SELECT * FROM rpt.txn WHERE merchant_code LIKE $2 AND customer_id = $1",
+        read="postgres",
+    )
+    # Without params -> LIKE $2 is not resolved, only eq is counted
+    f_no_params = extract_features(stmt)
+    assert f_no_params.predicates == (
+        PredicateFeature(column="customer_id", op="eq", value_count=1),
+    )
+
+    # Valid prefix pattern in params[1] -> counted as prefix_like
+    f_ok = extract_features(stmt, params=["C-1", "MRC01%"])
+    assert f_ok.predicates == (
+        PredicateFeature(column="merchant_code", op="prefix_like", value_count=1),
+        PredicateFeature(column="customer_id", op="eq", value_count=1),
+    )
+
+    # Escaped underscore / percent before trailing % -> valid prefix_like
+    f_esc = extract_features(stmt, params=["C-1", r"MRC\_01\%A%"])
+    assert f_esc.predicates[0] == PredicateFeature(
+        column="merchant_code", op="prefix_like", value_count=1
+    )
+
+    # Leading wildcard, interior wildcard, bare %, non-string, NOT LIKE -> rejected
+    for bad_pat in ("%MRC", "M_C%", "%", "MRC%01%", 123, True):
+        f_bad = extract_features(stmt, params=["C-1", bad_pat])
+        assert all(p.op != "prefix_like" for p in f_bad.predicates)
+
+    stmt_not = sqlglot.parse_one(
+        "SELECT * FROM rpt.txn WHERE NOT (merchant_code LIKE $1)",
+        read="postgres",
+    )
+    assert extract_features(stmt_not, params=["MRC01%"]).predicates == ()
+
+

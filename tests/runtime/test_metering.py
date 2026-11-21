@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -681,18 +682,86 @@ def test_verify_refuses_tampered_token():
     )
 
     parts = token.split(".")
-    # Tamper payload
-    tampered_payload = parts[1][:-1] + ("A" if parts[1][-1] != "A" else "B")
-    tampered_token = f"{parts[0]}.{tampered_payload}.{parts[2]}"
+
+    # Tamper payload deterministically
+    rem_payload = len(parts[1]) % 4
+    payload_padded = parts[1] + ("=" * ((4 - rem_payload) % 4))
+    payload_bytes = bytearray(base64.urlsafe_b64decode(payload_padded.encode("ascii")))
+    payload_bytes[0] ^= 0x01
+    tampered_payload = (
+        base64.urlsafe_b64encode(bytes(payload_bytes)).rstrip(b"=").decode("ascii")
+    )
+    tampered_payload_token = f"{parts[0]}.{tampered_payload}.{parts[2]}"
 
     with pytest.raises(MeteringError, match="Invalid token signature"):
-        verify_rollups(tampered_token, {"key-1": pub})
+        verify_rollups(tampered_payload_token, {"key-1": pub})
 
-    # Tamper signature
-    tampered_sig = parts[2][:-1] + ("X" if parts[2][-1] != "X" else "Y")
+    # Tamper signature deterministically
+    rem_sig = len(parts[2]) % 4
+    sig_padded = parts[2] + ("=" * ((4 - rem_sig) % 4))
+    sig_bytes = bytearray(base64.urlsafe_b64decode(sig_padded.encode("ascii")))
+    sig_bytes[0] ^= 0x01
+    tampered_sig = (
+        base64.urlsafe_b64encode(bytes(sig_bytes)).rstrip(b"=").decode("ascii")
+    )
     tampered_sig_token = f"{parts[0]}.{parts[1]}.{tampered_sig}"
+
     with pytest.raises(MeteringError, match="Invalid token signature"):
         verify_rollups(tampered_sig_token, {"key-1": pub})
+
+
+def test_verify_refuses_non_canonical_signature():
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    for _ in range(20):
+        priv, pub, _, _ = _make_key_pair()
+        t = datetime(2026, 11, 9, 10, 0, 0, tzinfo=timezone.utc)
+        r = HourlyRollup(
+            ws="ws-1",
+            hour_start=t,
+            kind="job",
+            release="atlas-rt/1.0.0",
+            acu=Decimal("1.000000"),
+            pod_seconds=Decimal("3600"),
+            record_count=1,
+        )
+        token = sign_rollups(
+            [r],
+            priv,
+            kid="key-1",
+            cell_id="cell-1",
+            issued_at=1700000000,
+        )
+
+        parts = token.split(".")
+        sig_b64 = parts[2]
+        rem_sig = len(sig_b64) % 4
+        sig_padded = sig_b64 + ("=" * ((4 - rem_sig) % 4))
+        orig_sig_bytes = base64.urlsafe_b64decode(sig_padded.encode("ascii"))
+
+        non_canonical_sig = None
+        for c in alphabet:
+            if c == sig_b64[-1]:
+                continue
+            cand = sig_b64[:-1] + c
+            cand_padded = cand + ("=" * ((4 - len(cand) % 4) % 4))
+            try:
+                cand_bytes = base64.urlsafe_b64decode(cand_padded.encode("ascii"))
+                if cand_bytes == orig_sig_bytes:
+                    non_canonical_sig = cand
+                    break
+            except Exception:
+                pass
+
+        assert non_canonical_sig is not None, "Failed to find non-canonical signature variant"
+        non_canonical_padded = non_canonical_sig + (
+            "=" * ((4 - len(non_canonical_sig) % 4) % 4)
+        )
+        decoded_bytes = base64.urlsafe_b64decode(non_canonical_padded.encode("ascii"))
+        assert decoded_bytes == orig_sig_bytes
+
+        tampered_token = f"{parts[0]}.{parts[1]}.{non_canonical_sig}"
+        with pytest.raises(MeteringError):
+            verify_rollups(tampered_token, {"key-1": pub})
 
 
 def test_verify_refuses_wrong_typ():

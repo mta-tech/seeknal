@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
@@ -15,7 +16,10 @@ import yaml
 
 from seeknal.serving.audit import verify_audit_config_offline
 from seeknal.serving.enforce import VALID_MASKS, VALID_OPS
+from seeknal.serving.errors import register_config_secrets
+from seeknal.serving.lakebase_endpoint import effective_storage_class
 from seeknal.serving.placement import (
+    VALID_ACCESS_PATTERNS,
     VALID_ENGINE_KINDS,
     VALID_TWIN_METHODS,
     Placement,
@@ -32,6 +36,7 @@ from seeknal.serving.server.config import (
     AuditStartupError,
     DuckDBConnectionConfig,
     LakebaseConnectionConfig,
+    PostgresConnectionConfig,
     ServerConfig,
     ServerConfigError,
     UniqueKeySafeLoader,
@@ -41,6 +46,28 @@ from seeknal.serving.server.config import (
     _reject_duplicate_json_keys,
     check_and_parse_secrets_env_file,
     check_extension_files_on_disk,
+)
+
+logger = logging.getLogger(__name__)
+
+_VALID_TABLE_ACCESS_FIELDS = frozenset(
+    {
+        "pattern",
+        "keys",
+        "filterable",
+        "range_filterable",
+        "prefix_filterable",
+        "sortable",
+        "require_filter",
+        "max_rows",
+    }
+)
+_TABLE_ACCESS_COL_LIST_FIELDS = (
+    "keys",
+    "filterable",
+    "range_filterable",
+    "prefix_filterable",
+    "sortable",
 )
 
 _SAFE_IDENT_RE = re.compile(r"^[\w][\w.-]{0,127}$", re.UNICODE)
@@ -66,6 +93,7 @@ _SENSITIVE_ENV_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 _ROLE_TOP_KEYS = frozenset({"roles", "role_policies", "default_role", "role_bindings", "role_grants"})
+DEFAULT_CURSOR_KEY_ENV = "SEEKNAL_CURSOR_KEY"
 
 
 class StartupValidationError(ServerConfigError):
@@ -83,6 +111,94 @@ class StartupValidationError(ServerConfigError):
         super().__init__("\n".join(deduped))
 
 
+class CursorKeyMissingError(StartupValidationError):
+    """Raised when the pagination cursor signing key is missing at server startup."""
+
+    code: str = "cursor_key_missing"
+
+    def __init__(self, problems: Sequence[str] | str) -> None:
+        super().__init__(problems)
+        self.code = "cursor_key_missing"
+
+
+class CursorKeyWeakError(StartupValidationError):
+    """Raised when the pagination cursor signing key is shorter than 32 bytes."""
+
+    code: str = "cursor_key_weak"
+
+    def __init__(self, problems: Sequence[str] | str) -> None:
+        super().__init__(problems)
+        self.code = "cursor_key_weak"
+
+
+def resolve_startup_cursor_key(
+    cfg: ServerConfig,
+    *,
+    cursor_key: bytes | str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> bytes | str:
+    """Resolve the pagination cursor signing key or raise CursorKeyMissingError / CursorKeyWeakError."""
+    env_var = cfg.cursor_key_env or DEFAULT_CURSOR_KEY_ENV
+    resolved: bytes | str | None = None
+    if cursor_key is not None and not isinstance(cursor_key, bool):
+        if isinstance(cursor_key, (bytes, bytearray)):
+            resolved = bytes(cursor_key)
+        elif isinstance(cursor_key, str):
+            resolved = cursor_key
+        else:
+            raise ServerConfigError("'cursor_key' must be str, bytes, or None")
+    elif isinstance(cursor_key, bool):
+        raise ServerConfigError("'cursor_key' must be str, bytes, or None")
+
+    if resolved is None:
+        sec_val = cfg.secrets_env.get(env_var)
+        if isinstance(sec_val, str) and sec_val:
+            resolved = sec_val
+        elif env is not None and isinstance(env.get(env_var), str) and env.get(env_var):
+            resolved = env.get(env_var)
+        else:
+            os_val = os.environ.get(env_var)
+            if isinstance(os_val, str) and os_val:
+                resolved = os_val
+
+    if resolved is None:
+        safe_var = _safe_ident(env_var)
+        raise CursorKeyMissingError(
+            f"cursor_key_missing: pagination cursor signing key is not configured; "
+            f"set environment variable '{safe_var}'"
+        )
+
+    try:
+        raw_bytes = (
+            resolved.encode("utf-8")
+            if isinstance(resolved, str)
+            else bytes(resolved)
+        )
+    except UnicodeEncodeError:
+        safe_var = _safe_ident(env_var)
+        raise CursorKeyWeakError(
+            f"cursor_key_weak: pagination cursor signing key in environment variable '{safe_var}' "
+            f"must be valid UTF-8 and at least 32 bytes"
+        ) from None
+
+    if len(raw_bytes) < 32:
+        safe_var = _safe_ident(env_var)
+        raise CursorKeyWeakError(
+            f"cursor_key_weak: pagination cursor signing key in environment variable '{safe_var}' "
+            f"must be at least 32 bytes (minimum 32 bytes)"
+        )
+
+    if isinstance(resolved, str):
+        register_config_secrets(resolved)
+    else:
+        try:
+            register_config_secrets(resolved.decode("utf-8"))
+        except UnicodeDecodeError:
+            pass
+
+    return resolved
+
+
 @dataclass(frozen=True)
 class ValidationReport:
     """Structured result of offline/startup validation."""
@@ -93,6 +209,7 @@ class ValidationReport:
     schemas: dict[str, list[str]] | None = None
     skipped: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
     role_model: str = "per_request_es256_grant_tokens"
     static_role_references_checked: int = 0
 
@@ -131,12 +248,18 @@ def _collect_secret_values(
         # Also include contents of any configured secret files
         sec_file_paths: list[str] = []
         for conn in cfg.connections.values():
+            top_dsn_file = getattr(conn, "dsn_file", None)
+            if isinstance(top_dsn_file, str) and top_dsn_file.strip():
+                sec_file_paths.append(top_dsn_file.strip())
             accounts = getattr(conn, "accounts", None)
             if isinstance(accounts, Mapping):
                 for acc in accounts.values():
                     pf = getattr(acc, "password_file", None)
                     if isinstance(pf, str) and pf.strip():
                         sec_file_paths.append(pf.strip())
+                    df = getattr(acc, "dsn_file", None)
+                    if isinstance(df, str) and df.strip():
+                        sec_file_paths.append(df.strip())
         if cfg.placement.discovery_config is not None:
             disc = cfg.placement.discovery_config
             if (
@@ -155,6 +278,10 @@ def _collect_secret_values(
                         sf_val = fh.read().strip()
                     if len(sf_val) >= 3:
                         candidates.add(sf_val)
+                        if "://" in sf_val and "@" in sf_val:
+                            m = _DSN_PASSWORD_EXTRACT_RE.search(sf_val)
+                            if m and len(m.group(1)) >= 3:
+                                candidates.add(m.group(1))
                 except Exception:
                     pass
 
@@ -166,8 +293,43 @@ def _collect_secret_values(
                 for v in parsed.values():
                     if isinstance(v, str) and len(v) >= 3:
                         candidates.add(v)
+                        if "://" in v and "@" in v:
+                            m = _DSN_PASSWORD_EXTRACT_RE.search(v)
+                            if m and len(m.group(1)) >= 3:
+                                candidates.add(m.group(1))
             except Exception:
                 pass
+        raw_conns = raw_cfg.get("connections")
+        if isinstance(raw_conns, Mapping):
+            raw_sec_files: list[str] = []
+            for rc_spec in raw_conns.values():
+                if not isinstance(rc_spec, Mapping):
+                    continue
+                for fk in ("dsn_file", "password_file"):
+                    fv = rc_spec.get(fk)
+                    if isinstance(fv, str) and fv.strip() and "://" not in fv:
+                        raw_sec_files.append(fv.strip())
+                rc_accs = rc_spec.get("accounts")
+                if isinstance(rc_accs, Mapping):
+                    for ra_spec in rc_accs.values():
+                        if isinstance(ra_spec, Mapping):
+                            for fk in ("dsn_file", "password_file"):
+                                fv = ra_spec.get(fk)
+                                if isinstance(fv, str) and fv.strip() and "://" not in fv:
+                                    raw_sec_files.append(fv.strip())
+            for rsf in raw_sec_files:
+                if os.path.isfile(rsf):
+                    try:
+                        with open(rsf, "r", encoding="utf-8") as fh:
+                            rsf_val = fh.read().strip()
+                        if len(rsf_val) >= 3:
+                            candidates.add(rsf_val)
+                            if "://" in rsf_val and "@" in rsf_val:
+                                m = _DSN_PASSWORD_EXTRACT_RE.search(rsf_val)
+                                if m and len(m.group(1)) >= 3:
+                                    candidates.add(m.group(1))
+                    except Exception:
+                        pass
 
     return tuple(sorted(candidates, key=len, reverse=True))
 
@@ -232,21 +394,56 @@ def _check_secret_files_all(
     problems: list[str],
     secret_values: Sequence[str],
 ) -> None:
-    """Collect all secret-file existence and permission errors without failing after the first."""
+    """Collect all secret-file existence, permission, and readability errors without failing after the first."""
     secret_files: list[tuple[str, str]] = []
 
-    for conn in cfg.connections.values():
+    for conn_name, conn in cfg.connections.items():
+        safe_conn = _safe_ident(conn_name, secret_values)
+        conn_kind = getattr(conn, "kind", None)
+        kind_label = (
+            "Postgres"
+            if isinstance(conn, PostgresConnectionConfig) or conn_kind == "postgres"
+            else "Lakebase"
+            if isinstance(conn, LakebaseConnectionConfig) or conn_kind == "lakebase"
+            else "Connection"
+        )
+        top_dfile = getattr(conn, "dsn_file", None)
+        if top_dfile:
+            secret_files.append(
+                (
+                    top_dfile,
+                    f"{kind_label} connection '{safe_conn}' dsn_file",
+                )
+            )
         accounts = getattr(conn, "accounts", None)
         if isinstance(accounts, Mapping):
             for acc_name, acc in accounts.items():
+                safe_acc = _safe_ident(acc_name, secret_values)
                 pfile = getattr(acc, "password_file", None)
                 if pfile:
                     secret_files.append(
                         (
                             pfile,
-                            f"StarRocks account '{_safe_ident(acc_name, secret_values)}' password_file",
+                            f"StarRocks account '{safe_acc}' password_file",
                         )
                     )
+                dfile = getattr(acc, "dsn_file", None)
+                if dfile:
+                    secret_files.append(
+                        (
+                            dfile,
+                            f"{kind_label} connection '{safe_conn}' account '{safe_acc}' dsn_file",
+                        )
+                    )
+        tls_obj = getattr(conn, "tls", None)
+        sslkey_file = getattr(tls_obj, "sslkey_file", None) if tls_obj is not None else None
+        if sslkey_file:
+            secret_files.append(
+                (
+                    sslkey_file,
+                    f"{kind_label} connection '{safe_conn}' tls.sslkey_file",
+                )
+            )
 
     if cfg.placement.discovery_config is not None:
         disc = cfg.placement.discovery_config
@@ -273,11 +470,123 @@ def _check_secret_files_all(
     for path, desc in secret_files:
         if not os.path.exists(path):
             problems.append(_scrub(f"{desc} not found: '{path}'", secret_values))
+        elif not os.path.isfile(path):
+            problems.append(_scrub(f"{desc} is not a regular file: '{path}'", secret_values))
         else:
-            st = os.stat(path)
+            try:
+                st = os.stat(path)
+            except OSError as exc:
+                problems.append(
+                    _scrub(
+                        f"{desc} '{path}' cannot be stat'd: {exc.strerror or type(exc).__name__}",
+                        secret_values,
+                    )
+                )
+                continue
             if (st.st_mode & 0o044) != 0:
                 problems.append(
                     _scrub(f"{desc} '{path}' is group- or world-readable", secret_values)
+                )
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    fh.read(1)
+            except OSError as exc:
+                problems.append(
+                    _scrub(
+                        f"{desc} '{path}' is not readable: {exc.strerror or type(exc).__name__}",
+                        secret_values,
+                    )
+                )
+
+
+def _storage_class_pii_problem(
+    safe_tbl: str,
+    safe_eng: str,
+    eng_kind: Any,
+    effective_sc: Any,
+    secret_values: Sequence[str],
+) -> str:
+    safe_kind = _safe_enum_token(str(eng_kind), secret_values)
+    safe_sc = _safe_enum_token(str(effective_sc), secret_values)
+    return (
+        f"table '{safe_tbl}' is pii: true but its serve engine '{safe_eng}' "
+        f"(kind {safe_kind}) has storage_class {safe_sc}; "
+        "CBN policy forbids PII in object storage — serve it from a postgres source "
+        "or list the engine in policy.pii_object_storage_engines"
+    )
+
+
+def _is_writable_postgres_wire_conn(conn: Any) -> bool:
+    if isinstance(conn, PostgresConnectionConfig):
+        return conn.mode == "read_write"
+    if isinstance(conn, LakebaseConnectionConfig):
+        lb_block = getattr(conn, "lakebase", None)
+        if lb_block is not None:
+            return getattr(lb_block, "endpoint_type", "read_write") == "read_write"
+        return conn.mode == "read_write"
+    return False
+
+
+def _collect_connection_warnings(
+    cfg: ServerConfig,
+    warnings_out: list[str],
+    secret_values: Sequence[str],
+) -> None:
+    """Collect non-fatal operational warnings for Postgres and Lakebase connections."""
+    for eng_name, conn in cfg.connections.items():
+        safe_eng = _safe_ident(eng_name, secret_values)
+        if isinstance(conn, LakebaseConnectionConfig):
+            if conn.lakebase is None:
+                warnings_out.append(
+                    f"connection '{safe_eng}' uses kind: lakebase without a lakebase: endpoint block; "
+                    "if this is a plain PostgreSQL database relabel it kind: postgres "
+                    "(mode: read_write keeps today's write behaviour), otherwise add the lakebase: block"
+                )
+                if conn.tls is None:
+                    warnings_out.append(
+                        f"legacy lakebase connection '{safe_eng}' has no explicit tls.sslmode "
+                        "configured; libpq default 'prefer' applies — configure 'tls.sslmode: verify-full'"
+                    )
+            else:
+                ep_type = getattr(conn.lakebase, "endpoint_type", conn.mode)
+                if ep_type == "read_only" or conn.mode == "read_only":
+                    warnings_out.append(
+                        f"connection '{safe_eng}': read_only Lakebase endpoints serve a frozen snapshot"
+                    )
+                max_conns = getattr(conn.lakebase, "max_connections", None)
+                if max_conns is not None:
+                    distinct_creds = 1
+                    if conn.accounts:
+                        cred_keys = {
+                            ("env", a.dsn_env)
+                            if a.dsn_env
+                            else ("file", os.path.abspath(a.dsn_file or ""))
+                            for a in conn.accounts.values()
+                        }
+                        distinct_creds = max(1, len(cred_keys))
+                    total_pool_budget = distinct_creds * int(conn.pool_max)
+                    if conn.pool_max > max_conns or total_pool_budget > max_conns:
+                        warnings_out.append(
+                            f"connection '{safe_eng}' pool_max budget ({total_pool_budget}, "
+                            f"pool_max={conn.pool_max}) exceeds lakebase.max_connections "
+                            f"({max_conns} for cu={getattr(conn.lakebase, 'cu', None)})"
+                        )
+            if conn.session is None:
+                warnings_out.append(
+                    f"connection '{safe_eng}' (kind lakebase) has no 'session' hardening block configured; "
+                    "configure 'session' for statement_timeout_ms, lock_timeout_ms, "
+                    "idle_in_transaction_session_timeout_ms, and search_path"
+                )
+        elif isinstance(conn, PostgresConnectionConfig):
+            if conn.session is None:
+                warnings_out.append(
+                    f"connection '{safe_eng}' (kind postgres) has no 'session' hardening block configured; "
+                    "configure 'session' for statement_timeout_ms, lock_timeout_ms, "
+                    "idle_in_transaction_session_timeout_ms, and search_path"
+                )
+            if conn.role_guard is False:
+                warnings_out.append(
+                    f"connection '{safe_eng}' has role_guard: false; superuser and BYPASSRLS checks are disabled"
                 )
 
 
@@ -684,6 +993,7 @@ def _validate_static_catalog(
     schemas_label: str,
     defined_roles: Mapping[str, Mapping[str, Any]],
     problems: list[str],
+    warnings_out: list[str],
     secret_values: Sequence[str],
 ) -> Placement | None:
     """Validate static placement, engine wiring, schemas, columns, table policies, and PII rules."""
@@ -714,6 +1024,11 @@ def _validate_static_catalog(
                 f"got {type(eng_spec).__name__}"
             )
             continue
+        if "storage_class" in eng_spec:
+            problems.append(
+                f"Engine '{safe_eng}' cannot declare 'storage_class' in placement; "
+                f"declare 'storage_class' on connections.{safe_eng} instead"
+            )
         kind = str(eng_spec.get("kind", "")).strip()
         if kind not in VALID_ENGINE_KINDS:
             problems.append(
@@ -737,7 +1052,7 @@ def _validate_static_catalog(
                     f"(kind '{_safe_enum_token(str(conn_kind), secret_values)}')"
                 )
 
-    # Validate policy engine-kind orders and policy.pii_engines
+    # Validate policy engine-kind orders, policy.pii_engines, and policy.pii_object_storage_engines
     for order_field in ("small_scan_order", "analytics_order"):
         if order_field in policy_raw:
             raw_order = policy_raw[order_field]
@@ -780,6 +1095,32 @@ def _validate_static_catalog(
                         f"Unknown engine '{safe_pe}' in policy.pii_engines (not configured in connections)"
                     )
 
+    pii_object_storage_engines_set: set[str] = set()
+    if "pii_object_storage_engines" in policy_raw:
+        raw_pose = policy_raw["pii_object_storage_engines"]
+        if not isinstance(raw_pose, (list, tuple)):
+            problems.append(
+                "Policy 'pii_object_storage_engines' must be a list or tuple of non-empty engine name strings"
+            )
+        else:
+            for item in raw_pose:
+                if not isinstance(item, str) or not item.strip():
+                    problems.append(
+                        "Policy 'pii_object_storage_engines' must contain only non-empty engine name strings"
+                    )
+                    continue
+                pose_name = item.strip()
+                pii_object_storage_engines_set.add(pose_name)
+                safe_pose = _safe_ident(pose_name, secret_values)
+                if pose_name not in declared_engines:
+                    problems.append(
+                        f"Unknown engine '{safe_pose}' in policy.pii_object_storage_engines (not declared in placement.engines)"
+                    )
+                elif pose_name not in cfg.connections:
+                    problems.append(
+                        f"Unknown engine '{safe_pose}' in policy.pii_object_storage_engines (not configured in connections)"
+                    )
+
     # Pre-collect pii_tables from top-level placement and placement.policy so PII rules fold in
     effective_pii_lower: set[str] = set()
     for pii_src_val in (pl_raw.get("pii_tables"), policy_raw.get("pii_tables")):
@@ -788,7 +1129,7 @@ def _validate_static_catalog(
                 if isinstance(p_item, str) and p_item.strip():
                     effective_pii_lower.add(p_item.strip().lower())
 
-    # 2. Validate tables (serves, PII rules, collisions)
+    # 2. Validate tables (serves, PII rules, access metadata, collisions)
     known_tables_by_lower: dict[str, str] = {}
     known_tables_by_casefold: dict[str, str] = {}
     for tbl_name, tbl_spec in tables_raw.items():
@@ -822,6 +1163,75 @@ def _validate_static_catalog(
             is_pii = t_lower in effective_pii_lower
         else:
             is_pii = pii_val or (t_lower in effective_pii_lower)
+
+        tokenized_val = tbl_spec.get("tokenized", False)
+        if not isinstance(tokenized_val, bool):
+            problems.append(
+                f"Static placement file '{placement_label}' table '{safe_tbl}' field 'tokenized' "
+                f"must be a boolean, got {type(tokenized_val).__name__}"
+            )
+            is_tokenized = False
+        else:
+            is_tokenized = tokenized_val
+
+        # Access metadata structural checks (pattern + point keys)
+        raw_access = tbl_spec.get("access")
+        if raw_access is not None:
+            if not isinstance(raw_access, Mapping):
+                problems.append(
+                    f"Table '{safe_tbl}' field 'access' must be a mapping, got {type(raw_access).__name__}"
+                )
+            else:
+                unknown_acc_fields = set(raw_access.keys()) - _VALID_TABLE_ACCESS_FIELDS
+                if unknown_acc_fields:
+                    safe_unk = ", ".join(
+                        sorted(_safe_ident(str(k), secret_values) for k in unknown_acc_fields)
+                    )
+                    problems.append(
+                        f"Table '{safe_tbl}' access contains unknown field(s): {safe_unk}"
+                    )
+                acc_pat = raw_access.get("pattern", "scan")
+                if not isinstance(acc_pat, str) or acc_pat not in VALID_ACCESS_PATTERNS:
+                    problems.append(
+                        f"Table '{safe_tbl}' access has invalid pattern "
+                        f"'{_safe_enum_token(acc_pat, secret_values)}'; "
+                        f"must be one of {sorted(VALID_ACCESS_PATTERNS)}"
+                    )
+                for col_field in _TABLE_ACCESS_COL_LIST_FIELDS:
+                    if col_field in raw_access and raw_access[col_field] is not None:
+                        col_seq = raw_access[col_field]
+                        if not isinstance(col_seq, (list, tuple)) or any(
+                            not isinstance(c, str) or not c.strip() for c in col_seq
+                        ):
+                            problems.append(
+                                f"Table '{safe_tbl}' access field '{col_field}' must be a list of non-empty column name strings"
+                            )
+                if "require_filter" in raw_access and not isinstance(
+                    raw_access["require_filter"], bool
+                ):
+                    problems.append(
+                        f"Table '{safe_tbl}' access field 'require_filter' must be a boolean"
+                    )
+                if "max_rows" in raw_access and raw_access["max_rows"] is not None:
+                    mr_val = raw_access["max_rows"]
+                    if isinstance(mr_val, bool) or not isinstance(mr_val, int) or mr_val <= 0:
+                        problems.append(
+                            f"Table '{safe_tbl}' access field 'max_rows' must be a positive integer"
+                        )
+                if acc_pat == "point":
+                    raw_acc_keys = raw_access.get("keys")
+                    raw_tbl_keys = tbl_spec.get("keys")
+                    eff_point_keys = (
+                        [k for k in raw_acc_keys if isinstance(k, str) and k.strip()]
+                        if isinstance(raw_acc_keys, (list, tuple)) and raw_acc_keys
+                        else [k for k in raw_tbl_keys if isinstance(k, str) and k.strip()]
+                        if isinstance(raw_tbl_keys, (list, tuple)) and raw_tbl_keys
+                        else []
+                    )
+                    if not eff_point_keys:
+                        problems.append(
+                            f"Table '{safe_tbl}' access with pattern 'point' requires non-empty 'keys'"
+                        )
 
         serve_raw = tbl_spec.get("serve")
         if serve_raw is not None and not isinstance(serve_raw, Mapping):
@@ -864,7 +1274,7 @@ def _validate_static_catalog(
                     f"Table '{safe_tbl}' serve has invalid format for engine '{safe_s_eng}'"
                 )
 
-        if is_pii:
+        if is_pii and not is_tokenized:
             if len(serve_raw) != 1:
                 problems.append(
                     f"PII table '{safe_tbl}' must have exactly one serve, got {len(serve_raw)}"
@@ -884,6 +1294,31 @@ def _validate_static_catalog(
                         f"PII table '{safe_tbl}' cannot be served on duckdb engine "
                         f"'{safe_s_eng}'{profile_note} unless listed in policy.pii_engines"
                     )
+                if conn_obj is not None:
+                    try:
+                        effective_sc = effective_storage_class(conn_obj)
+                    except ValueError as exc:
+                        problems.append(_scrub(str(exc), secret_values))
+                        effective_sc = None
+                    if (
+                        effective_sc is not None
+                        and effective_sc != "local"
+                        and s_eng_str not in pii_object_storage_engines_set
+                    ):
+                        problems.append(
+                            _storage_class_pii_problem(
+                                safe_tbl,
+                                safe_s_eng,
+                                eng_kind,
+                                effective_sc,
+                                secret_values,
+                            )
+                        )
+                    if _is_writable_postgres_wire_conn(conn_obj):
+                        warnings_out.append(
+                            f"PII table '{safe_tbl}' is served on writable source "
+                            f"'{safe_s_eng}' (mode read_write); prefer a read_only source for PII"
+                        )
 
     # 3. Validate cubes
     known_cubes_by_lower: dict[str, str] = {}
@@ -949,6 +1384,27 @@ def _validate_static_catalog(
             problems.append(
                 f"PII cube '{safe_cube}' engine '{safe_c_eng}' must be listed in policy.pii_engines"
             )
+        if is_cube_pii and cube_eng in cfg.connections:
+            cube_conn_obj = cfg.connections[cube_eng]
+            try:
+                cube_sc = effective_storage_class(cube_conn_obj)
+            except ValueError as exc:
+                problems.append(_scrub(str(exc), secret_values))
+                cube_sc = None
+            if (
+                cube_sc is not None
+                and cube_sc != "local"
+                and cube_eng not in pii_object_storage_engines_set
+            ):
+                problems.append(
+                    _storage_class_pii_problem(
+                        safe_cube,
+                        safe_c_eng,
+                        "cube",
+                        cube_sc,
+                        secret_values,
+                    )
+                )
 
         raw_dims_pre = cube_spec.get("dimensions")
         dims_list = (
@@ -1110,6 +1566,22 @@ def _validate_static_catalog(
                 secret_values=secret_values,
             )
 
+            raw_access_for_cols = tbl_spec.get("access")
+            if isinstance(raw_access_for_cols, Mapping):
+                for acc_col_field in _TABLE_ACCESS_COL_LIST_FIELDS:
+                    acc_cols_seq = raw_access_for_cols.get(acc_col_field)
+                    if isinstance(acc_cols_seq, (list, tuple)):
+                        for acc_col in acc_cols_seq:
+                            if not isinstance(acc_col, str) or not acc_col.strip():
+                                continue
+                            ac_str = acc_col.strip()
+                            if ac_str.lower() not in cols_lower:
+                                problems.append(
+                                    f"Unknown column '{_safe_ident(ac_str, secret_values)}' in "
+                                    f"'placement.tables.{safe_tbl}.access.{acc_col_field}' for table "
+                                    f"'{safe_tbl}' (not found in schemas for '{safe_tbl}')"
+                                )
+
             # Policy-level table specs (if present)
             for pol_tbl_container_name, pol_tbl_container in (
                 ("placement.policy.tables", policy_raw.get("tables")),
@@ -1224,6 +1696,7 @@ def _validate_discovery_table_ref_offline(
     raw_name: Any,
     *,
     default_catalog: str,
+    allowed_catalogs: frozenset[str] | None = None,
     field_label: str,
     problems: list[str],
     secret_values: Sequence[str],
@@ -1246,7 +1719,12 @@ def _validate_discovery_table_ref_offline(
             f"expected 3-part '<default_catalog>.<namespace>.<table>'"
         )
         return
-    if parts[0].lower() != default_catalog.lower():
+    valid_cats = (
+        {c.lower() for c in allowed_catalogs}
+        if allowed_catalogs is not None
+        else {default_catalog.lower()}
+    )
+    if parts[0].lower() not in valid_cats:
         problems.append(
             f"Discovery table '{_safe_ident(raw_name, secret_values)}' in '{field_label}' has catalog "
             f"prefix '{_safe_ident(parts[0], secret_values)}', expected default_catalog "
@@ -1258,11 +1736,23 @@ def _validate_discovery_offline(
     *,
     cfg: ServerConfig,
     problems: list[str],
+    warnings_out: list[str],
     secret_values: Sequence[str],
 ) -> None:
     """Validate offline-checkable discovery engine wiring and PII configuration."""
     disc_cfg = cfg.placement.discovery_config
     assert disc_cfg is not None
+
+    if isinstance(cfg.placement.discovery, Mapping):
+        raw_disc_engines = cfg.placement.discovery.get("engines")
+        if isinstance(raw_disc_engines, Mapping):
+            for rd_name, rd_spec in raw_disc_engines.items():
+                if isinstance(rd_spec, Mapping) and "storage_class" in rd_spec:
+                    safe_rd = _safe_ident(str(rd_name), secret_values)
+                    problems.append(
+                        f"Engine '{safe_rd}' cannot declare 'storage_class' in placement; "
+                        f"declare 'storage_class' on connections.{safe_rd} instead"
+                    )
 
     for eng_name, eng_cfg in disc_cfg.engines.items():
         safe_eng = _safe_ident(eng_name, secret_values)
@@ -1286,6 +1776,155 @@ def _validate_discovery_offline(
                     f"'{_safe_enum_token(conn_kind, secret_values)}'"
                 )
 
+    pii_engines_set = set(disc_cfg.pii_engines)
+    for pe in disc_cfg.pii_engines:
+        safe_pe = _safe_ident(pe, secret_values)
+        if pe not in disc_cfg.engines:
+            problems.append(
+                f"Unknown engine '{safe_pe}' in discovery pii_engines "
+                f"(not declared in placement.discovery.engines)"
+            )
+        elif pe not in cfg.connections:
+            problems.append(
+                f"Unknown engine '{safe_pe}' in discovery pii_engines "
+                f"(not configured in connections)"
+            )
+
+    pii_obj_set = set(disc_cfg.pii_object_storage_engines)
+    for pose in disc_cfg.pii_object_storage_engines:
+        safe_pose = _safe_ident(pose, secret_values)
+        if pose not in disc_cfg.engines:
+            problems.append(
+                f"Unknown engine '{safe_pose}' in discovery pii_object_storage_engines "
+                f"(not declared in placement.discovery.engines)"
+            )
+        elif pose not in cfg.connections:
+            problems.append(
+                f"Unknown engine '{safe_pose}' in discovery pii_object_storage_engines "
+                f"(not configured in connections)"
+            )
+
+    # Validate postgres_sources wiring, accounts, and §2.3 storage-class PII rule
+    for src_eng, src_cfg in disc_cfg.postgres_sources.items():
+        safe_src = _safe_ident(src_eng, secret_values)
+        if src_eng not in disc_cfg.engines:
+            problems.append(
+                f"Discovery 'placement.discovery.postgres_sources.{safe_src}' "
+                f"references unknown engine '{safe_src}'"
+            )
+        if src_eng not in cfg.connections:
+            problems.append(
+                f"Discovery 'placement.discovery.postgres_sources.{safe_src}' "
+                f"has no matching entry 'connections.{safe_src}'"
+            )
+            continue
+
+        src_conn = cfg.connections[src_eng]
+        src_conn_kind = getattr(src_conn, "kind", None)
+        if src_conn_kind not in ("postgres", "lakebase"):
+            problems.append(
+                f"Discovery 'placement.discovery.postgres_sources.{safe_src}' requires "
+                f"'connections.{safe_src}' to have kind 'postgres' or 'lakebase', got "
+                f"'{_safe_enum_token(src_conn_kind, secret_values)}'"
+            )
+            continue
+
+        src_accounts = getattr(src_conn, "accounts", None)
+        if isinstance(src_accounts, Mapping) and src_accounts:
+            if src_cfg.account not in src_accounts:
+                problems.append(
+                    f"Discovery 'placement.discovery.postgres_sources.{safe_src}.account' "
+                    f"('{_safe_enum_token(src_cfg.account, secret_values)}') is not configured "
+                    f"in 'connections.{safe_src}.accounts'"
+                )
+
+        try:
+            src_sc = effective_storage_class(src_conn)
+        except ValueError as exc:
+            problems.append(_scrub(str(exc), secret_values))
+            src_sc = None
+
+        src_is_writable = _is_writable_postgres_wire_conn(src_conn)
+        log_cat_safe = _safe_ident(src_cfg.logical_catalog, secret_values)
+        emitted_src_pii_labels: set[str] = set()
+
+        for phys_sch, sch_cfg in src_cfg.schemas.items():
+            if sch_cfg.pii is True and not sch_cfg.tokenized:
+                log_sch = src_cfg.schema_map.get(phys_sch, phys_sch)
+                log_sch_safe = _safe_ident(log_sch, secret_values)
+                for inc_pat in sch_cfg.include:
+                    if "*" in inc_pat or "?" in inc_pat:
+                        tbl_label = f"{log_cat_safe}.{log_sch_safe}.*"
+                    else:
+                        cand_full = f"{src_cfg.logical_catalog}.{log_sch}.{inc_pat}"
+                        ov = src_cfg.tables.get(cand_full)
+                        if ov is not None and (ov.tokenized is True or ov.pii is False):
+                            continue
+                        tbl_label = _safe_ident(cand_full, secret_values)
+                    if tbl_label in emitted_src_pii_labels:
+                        continue
+                    emitted_src_pii_labels.add(tbl_label)
+                    if (
+                        src_sc is not None
+                        and src_sc != "local"
+                        and src_eng not in pii_obj_set
+                    ):
+                        problems.append(
+                            _storage_class_pii_problem(
+                                tbl_label,
+                                safe_src,
+                                src_conn_kind,
+                                src_sc,
+                                secret_values,
+                            )
+                        )
+                    if src_is_writable:
+                        warnings_out.append(
+                            f"PII table '{tbl_label}' is served on writable source "
+                            f"'{safe_src}' (mode read_write); prefer a read_only source for PII"
+                        )
+
+        rev_schema_map = {v: k for k, v in src_cfg.schema_map.items()}
+        for tbl_key, ov_cfg in src_cfg.tables.items():
+            parts = tbl_key.split(".")
+            log_sch_part = parts[1] if len(parts) == 3 else ""
+            phys_sch_part = rev_schema_map.get(log_sch_part, log_sch_part)
+            base_sch = src_cfg.schemas.get(phys_sch_part)
+            eff_ov_pii = (
+                ov_cfg.pii
+                if ov_cfg.pii is not None
+                else (base_sch.pii if base_sch is not None else False)
+            )
+            eff_ov_tok = (
+                ov_cfg.tokenized
+                if ov_cfg.tokenized is not None
+                else (base_sch.tokenized if base_sch is not None else False)
+            )
+            if eff_ov_pii is True and not eff_ov_tok:
+                safe_ov_tbl = _safe_ident(tbl_key, secret_values)
+                if safe_ov_tbl in emitted_src_pii_labels:
+                    continue
+                emitted_src_pii_labels.add(safe_ov_tbl)
+                if (
+                    src_sc is not None
+                    and src_sc != "local"
+                    and src_eng not in pii_obj_set
+                ):
+                    problems.append(
+                        _storage_class_pii_problem(
+                            safe_ov_tbl,
+                            safe_src,
+                            src_conn_kind,
+                            src_sc,
+                            secret_values,
+                        )
+                    )
+                if src_is_writable:
+                    warnings_out.append(
+                        f"PII table '{safe_ov_tbl}' is served on writable source "
+                        f"'{safe_src}' (mode read_write); prefer a read_only source for PII"
+                    )
+
     if disc_cfg.lakebase is not None:
         lb_eng = disc_cfg.lakebase.engine
         safe_lb = _safe_ident(lb_eng, secret_values)
@@ -1307,6 +1946,35 @@ def _validate_discovery_offline(
                     f"'connections.{safe_lb}' to have kind 'lakebase', got "
                     f"'{_safe_enum_token(conn_kind, secret_values)}'"
                 )
+            else:
+                try:
+                    lb_sc = effective_storage_class(lb_conn)
+                except ValueError as exc:
+                    problems.append(_scrub(str(exc), secret_values))
+                    lb_sc = None
+                lb_writable = _is_writable_postgres_wire_conn(lb_conn)
+                for st_name, st_cfg in disc_cfg.lakebase.synced_tables.items():
+                    if st_cfg.pii is True:
+                        safe_st = _safe_ident(st_name, secret_values)
+                        if (
+                            lb_sc is not None
+                            and lb_sc != "local"
+                            and lb_eng not in pii_obj_set
+                        ):
+                            problems.append(
+                                _storage_class_pii_problem(
+                                    safe_st,
+                                    safe_lb,
+                                    "lakebase",
+                                    lb_sc,
+                                    secret_values,
+                                )
+                            )
+                        if lb_writable:
+                            warnings_out.append(
+                                f"PII table '{safe_st}' is served on writable source "
+                                f"'{safe_lb}' (mode read_write); prefer a read_only source for PII"
+                            )
 
         for st_name in disc_cfg.lakebase.synced_tables.keys():
             _validate_discovery_table_ref_offline(
@@ -1317,17 +1985,22 @@ def _validate_discovery_offline(
                 secret_values=secret_values,
             )
 
+    allowed_pii_cats = frozenset(
+        {disc_cfg.default_catalog}
+        | {s.logical_catalog for s in disc_cfg.postgres_sources.values()}
+    )
     for pt in disc_cfg.pii_tables:
         _validate_discovery_table_ref_offline(
             pt,
             default_catalog=disc_cfg.default_catalog,
+            allowed_catalogs=allowed_pii_cats,
             field_label="pii_tables",
             problems=problems,
             secret_values=secret_values,
         )
 
     if disc_cfg.lakekeeper is None:
-        if disc_cfg.pii_tables:
+        if disc_cfg.pii_tables and not disc_cfg.postgres_sources:
             problems.append(
                 "Discovery 'pii_tables' cannot be configured when 'placement.discovery.lakekeeper' is not configured"
             )
@@ -1338,43 +2011,56 @@ def _validate_discovery_offline(
                 "Discovery 'synced_tables' with 'pii: true' cannot be configured when 'placement.discovery.lakekeeper' is not configured"
             )
 
-    pii_engines_set = set(disc_cfg.pii_engines)
-    for pe in disc_cfg.pii_engines:
-        safe_pe = _safe_ident(pe, secret_values)
-        if pe not in disc_cfg.engines:
-            problems.append(
-                f"Unknown engine '{safe_pe}' in discovery pii_engines "
-                f"(not declared in placement.discovery.engines)"
-            )
-        elif pe not in cfg.connections:
-            problems.append(
-                f"Unknown engine '{safe_pe}' in discovery pii_engines "
-                f"(not configured in connections)"
-            )
-
-    # Offline PII serving feasibility check for discovery pii_tables and synced pii tables
+    # Offline PII serving feasibility & storage_class check for discovery pii_tables
     synced_lower = (
         {k.lower() for k in disc_cfg.lakebase.synced_tables.keys()}
         if disc_cfg.lakebase is not None
         else set()
     )
-    has_starrocks = any(e.kind == "starrocks" for e in disc_cfg.engines.values())
-    has_approved_duckdb = any(
-        e.kind == "duckdb"
+    starrocks_engines = [
+        e for e in disc_cfg.engines.values() if e.kind == "starrocks"
+    ]
+    approved_duckdb_engines = [
+        e
+        for e in disc_cfg.engines.values()
+        if e.kind == "duckdb"
         and e.profile == "iceberg_direct"
         and e.name in pii_engines_set
-        for e in disc_cfg.engines.values()
-    )
-    unapproved_duck_names = [
-        _safe_ident(e.name, secret_values)
+    ]
+    unapproved_duck_engines = [
+        e
         for e in disc_cfg.engines.values()
         if e.kind == "duckdb" and e.name not in pii_engines_set
     ]
+    unapproved_duck_names = [
+        _safe_ident(e.name, secret_values) for e in unapproved_duck_engines
+    ]
+    has_starrocks = bool(starrocks_engines)
+    has_approved_duckdb = bool(approved_duckdb_engines)
 
     for pt in disc_cfg.pii_tables:
         safe_pt = _safe_ident(pt, secret_values)
+        pt_parts = pt.split(".") if isinstance(pt, str) else []
+        matching_pg_eng: str | None = None
+        if len(pt_parts) == 3:
+            pt_cat_low, pt_sch_low, _ = (p.lower() for p in pt_parts)
+            for pg_eng, pg_src in disc_cfg.postgres_sources.items():
+                if pg_src.logical_catalog.lower() == pt_cat_low:
+                    exposed_log_schemas = {
+                        pg_src.schema_map.get(ps, ps).lower()
+                        for ps in pg_src.schemas.keys()
+                    }
+                    if pt_sch_low in exposed_log_schemas:
+                        matching_pg_eng = pg_eng
+                        break
+
         in_synced = isinstance(pt, str) and pt.lower() in synced_lower
-        if not (in_synced or has_starrocks or has_approved_duckdb):
+        if not (
+            matching_pg_eng is not None
+            or in_synced
+            or has_starrocks
+            or has_approved_duckdb
+        ):
             if unapproved_duck_names:
                 unapproved_str = ", ".join(unapproved_duck_names)
                 problems.append(
@@ -1386,6 +2072,48 @@ def _validate_discovery_offline(
                 problems.append(
                     f"Discovery PII table '{safe_pt}' has no valid serving engine configured "
                     f"(not in lakebase.synced_tables and no starrocks or approved iceberg_direct pii_engines)"
+                )
+
+        # Determine effective single-serve engine for §2.3 storage_class check
+        chosen_pii_eng: str | None = None
+        if matching_pg_eng is not None:
+            chosen_pii_eng = matching_pg_eng
+        elif in_synced and disc_cfg.lakebase is not None:
+            chosen_pii_eng = disc_cfg.lakebase.engine
+        elif starrocks_engines:
+            chosen_pii_eng = starrocks_engines[0].name
+        elif approved_duckdb_engines:
+            chosen_pii_eng = approved_duckdb_engines[0].name
+        elif unapproved_duck_engines:
+            chosen_pii_eng = unapproved_duck_engines[0].name
+
+        if chosen_pii_eng is not None and chosen_pii_eng in cfg.connections:
+            chosen_conn = cfg.connections[chosen_pii_eng]
+            chosen_kind = getattr(chosen_conn, "kind", None)
+            try:
+                chosen_sc = effective_storage_class(chosen_conn)
+            except ValueError as exc:
+                problems.append(_scrub(str(exc), secret_values))
+                chosen_sc = None
+            if (
+                chosen_sc is not None
+                and chosen_sc != "local"
+                and chosen_pii_eng not in pii_obj_set
+            ):
+                problems.append(
+                    _storage_class_pii_problem(
+                        safe_pt,
+                        _safe_ident(chosen_pii_eng, secret_values),
+                        chosen_kind,
+                        chosen_sc,
+                        secret_values,
+                    )
+                )
+            if _is_writable_postgres_wire_conn(chosen_conn):
+                warnings_out.append(
+                    f"PII table '{safe_pt}' is served on writable source "
+                    f"'{_safe_ident(chosen_pii_eng, secret_values)}' (mode read_write); "
+                    "prefer a read_only source for PII"
                 )
 
 
@@ -1507,6 +2235,8 @@ def validate_startup(
     raw_placement: Mapping[str, Any] | None = None,
     raw_schemas: Mapping[str, Sequence[str]] | None = None,
     check_grant_keys: bool = True,
+    check_cursor_key: bool = False,
+    cursor_key: bytes | str | None = None,
 ) -> ValidationReport:
     """Perform comprehensive fail-closed startup validation.
 
@@ -1578,6 +2308,15 @@ def validate_startup(
             d_sub = raw_cfg["placement"].get("discovery")
             if isinstance(d_sub, Mapping):
                 raw_disc = d_sub
+                d_engs = d_sub.get("engines")
+                if isinstance(d_engs, Mapping):
+                    for d_ename, d_espec in d_engs.items():
+                        if isinstance(d_espec, Mapping) and "storage_class" in d_espec:
+                            safe_de = _safe_ident(str(d_ename), secret_values)
+                            problems.append(
+                                f"Engine '{safe_de}' cannot declare 'storage_class' in placement; "
+                                f"declare 'storage_class' on connections.{safe_de} instead"
+                            )
             st_sub = raw_cfg["placement"].get("static")
             if (
                 raw_pl_for_roles is None
@@ -1596,6 +2335,9 @@ def validate_startup(
             secret_values=secret_values,
         )
         raise StartupValidationError([_scrub(p, secret_values) for p in problems])
+
+    warnings_out: list[str] = []
+    _collect_connection_warnings(cfg, warnings_out, secret_values)
 
     # 2. Validate grant keys, environment variables, secret files, and iceberg_direct extension files
     for eng_name, conn in cfg.connections.items():
@@ -1625,8 +2367,24 @@ def validate_startup(
         if var_name in seen_vars:
             continue
         seen_vars.add(var_name)
+        if cfg.cursor_key_env is not None and var_name == cfg.cursor_key_env:
+            continue
         try:
             cfg.get_env(var_name, env)
+        except ServerConfigError as exc:
+            problems.append(_scrub(str(exc), secret_values))
+
+    cursor_key_missing_error = False
+    cursor_key_weak_error = False
+    if check_cursor_key or cfg.cursor_key_env is not None:
+        try:
+            resolve_startup_cursor_key(cfg, cursor_key=cursor_key, env=env)
+        except CursorKeyMissingError as exc:
+            cursor_key_missing_error = True
+            problems.extend(_scrub(p, secret_values) for p in exc.problems)
+        except CursorKeyWeakError as exc:
+            cursor_key_weak_error = True
+            problems.extend(_scrub(p, secret_values) for p in exc.problems)
         except ServerConfigError as exc:
             problems.append(_scrub(str(exc), secret_values))
 
@@ -1681,11 +2439,24 @@ def validate_startup(
                 schemas_label=schemas_label,
                 defined_roles=defined_roles,
                 problems=problems,
+                warnings_out=warnings_out,
                 secret_values=secret_values,
             )
 
         if problems:
-            raise StartupValidationError([_scrub(p, secret_values) for p in problems])
+            if cursor_key_missing_error:
+                err_cls = CursorKeyMissingError
+            elif cursor_key_weak_error:
+                err_cls = CursorKeyWeakError
+            else:
+                err_cls = StartupValidationError
+            raise err_cls([_scrub(p, secret_values) for p in problems])
+
+        clean_warnings = tuple(
+            dict.fromkeys(_scrub(w, secret_values) for w in warnings_out)
+        )
+        for w_msg in clean_warnings:
+            logger.warning("%s", w_msg)
 
         notes: list[str] = []
         if role_refs_checked == 0 and not defined_roles:
@@ -1698,6 +2469,7 @@ def validate_startup(
             schemas=validated_schemas,
             skipped=(),
             notes=tuple(notes),
+            warnings=clean_warnings,
             static_role_references_checked=role_refs_checked,
         )
 
@@ -1713,11 +2485,24 @@ def validate_startup(
     _validate_discovery_offline(
         cfg=cfg,
         problems=problems,
+        warnings_out=warnings_out,
         secret_values=secret_values,
     )
 
     if problems:
-        raise StartupValidationError([_scrub(p, secret_values) for p in problems])
+        if cursor_key_missing_error:
+            err_cls_disc = CursorKeyMissingError
+        elif cursor_key_weak_error:
+            err_cls_disc = CursorKeyWeakError
+        else:
+            err_cls_disc = StartupValidationError
+        raise err_cls_disc([_scrub(p, secret_values) for p in problems])
+
+    clean_disc_warnings = tuple(
+        dict.fromkeys(_scrub(w, secret_values) for w in warnings_out)
+    )
+    for w_msg in clean_disc_warnings:
+        logger.warning("%s", w_msg)
 
     notes_disc: list[str] = []
     if role_refs_checked == 0 and not defined_roles:
@@ -1730,6 +2515,7 @@ def validate_startup(
         schemas=None,
         skipped=("live_catalog_discovery",),
         notes=tuple(notes_disc),
+        warnings=clean_disc_warnings,
         static_role_references_checked=role_refs_checked,
     )
 

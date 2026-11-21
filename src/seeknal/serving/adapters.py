@@ -1,4 +1,4 @@
-"""Engine adapters for Seeknal Serving: DuckDB, StarRocks, Lakebase, and Cube."""
+"""Engine adapters for Seeknal Serving: DuckDB, StarRocks, Postgres, Lakebase, and Cube."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ class QueryResult:
     engine: str
     elapsed_ms: float
     column_types: tuple[str, ...] = ()
+    cold_start: bool | None = None
 
 
 class EngineError(Exception):
@@ -52,7 +53,30 @@ class EngineCancelled(EngineError):
 
 
 class EnginePoolExhausted(EngineConfigError):
-    """Raised when Lakebase connection pool is exhausted."""
+    """Raised when Postgres/Lakebase connection pool is exhausted."""
+
+
+class PostgresSessionHardeningError(EngineError):
+    """Raised when role guard or session hardening verification refuses a connection."""
+
+
+from seeknal.serving.lakebase_endpoint import (  # noqa: E402
+    ColdStartConnector,
+    EngineStartingError,
+    effective_storage_class,
+    role_guard_sql,
+    snapshot_freshness,
+)
+from seeknal.serving.postgres_session import (  # noqa: E402
+    POSTGRES_WIRE_KINDS,
+    PostgresAccountConfig,
+    PostgresSessionConfig,
+    PostgresTLSConfig,
+    begin_query_transaction,
+    build_connect_kwargs,
+    is_postgres_wire,
+    verify_and_harden_session,
+)
 
 
 @dataclass(frozen=True)
@@ -451,6 +475,10 @@ class DuckDBAdapter:
         self._seen_file_inst_id: int | None = None
         self._file_generation = 0
         self._slots_lock = threading.Lock()
+        self.storage_class: str | None = None
+        self.account: str | None = None
+        self.lakebase_endpoint: dict[str, str] | None = None
+        self.last_cold_start: bool | None = None
 
     def _note_cursor_instance(self, cur: Any) -> None:
         inst = getattr(cur, "_instance", None)
@@ -1100,8 +1128,8 @@ class PooledConnection:
         self.last_used_at = created_at
 
 
-class LakebasePool:
-    """Thread-safe connection pool for Lakebase connections."""
+class PostgresPool:
+    """Thread-safe connection pool for PostgreSQL-wire (postgres and lakebase) connections."""
 
     def __init__(
         self,
@@ -1151,7 +1179,7 @@ class LakebasePool:
                 self._reaper_thread = threading.Thread(
                     target=self._reaper_loop,
                     daemon=True,
-                    name="lakebase-reaper",
+                    name="postgres-reaper",
                 )
                 self._reaper_thread.start()
 
@@ -1179,14 +1207,25 @@ class LakebasePool:
             for c in to_close:
                 self._close_conn(c)
 
-    def _create_connection(self) -> Any:
-        sig = inspect.signature(self._connect_fn)
-        if "connect_timeout" in sig.parameters:
-            return self._connect_fn(connect_timeout=self._connect_timeout_seconds)
+    def _create_connection(self, *, deadline: float | None = None) -> Any:
         try:
-            return self._connect_fn(connect_timeout=self._connect_timeout_seconds)
-        except TypeError:
+            sig = inspect.signature(self._connect_fn)
+            params = sig.parameters
+            call_kwargs: dict[str, Any] = {}
+            if "connect_timeout" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            ):
+                call_kwargs["connect_timeout"] = self._connect_timeout_seconds
+            if deadline is not None and "deadline" in params:
+                call_kwargs["deadline"] = deadline
+            if call_kwargs:
+                return self._connect_fn(**call_kwargs)
             return self._connect_fn()
+        except TypeError:
+            try:
+                return self._connect_fn(connect_timeout=self._connect_timeout_seconds)
+            except TypeError:
+                return self._connect_fn()
 
     def _close_conn(self, conn: Any) -> None:
         try:
@@ -1241,9 +1280,9 @@ class LakebasePool:
                     return True
         return False
 
-    def acquire(self) -> Any:
+    def acquire(self, *, deadline: float | None = None) -> Any:
         self._ensure_reaper_started()
-        deadline = time.monotonic() + self._acquire_timeout_seconds
+        acq_deadline = time.monotonic() + self._acquire_timeout_seconds
         to_close_expired = []
         with self._cond:
             while True:
@@ -1274,7 +1313,7 @@ class LakebasePool:
                     self._total_count += 1
                     break
 
-                remaining = deadline - time.monotonic()
+                remaining = acq_deadline - time.monotonic()
                 if remaining <= 0:
                     for c in to_close_expired:
                         self._close_conn(c)
@@ -1283,7 +1322,7 @@ class LakebasePool:
                     )
                 self._cond.wait(timeout=remaining)
                 if (
-                    time.monotonic() >= deadline
+                    time.monotonic() >= acq_deadline
                     and not self._idle
                     and self._total_count >= self._pool_max
                 ):
@@ -1297,7 +1336,7 @@ class LakebasePool:
             self._close_conn(c)
 
         try:
-            conn = self._create_connection()
+            conn = self._create_connection(deadline=deadline)
         except Exception:
             with self._cond:
                 self._total_count -= 1
@@ -1373,39 +1412,134 @@ class LakebasePool:
             }
 
 
+LakebasePool = PostgresPool
+
+
 class DBAPIAdapter:
-    """Adapter for DB-API 2.0 drivers (pymysql, psycopg2) for StarRocks, Lakebase, and Cube."""
+    """Adapter for DB-API 2.0 drivers (pymysql, psycopg2) for Postgres, Lakebase, StarRocks, and Cube."""
 
     def __init__(
         self,
-        connect: Callable[[], Any],
+        connect: Callable[..., Any],
         *,
         kind: str,
         before_connect: Callable[[], None] | None = None,
-        pool: LakebasePool | None = None,
+        pool: PostgresPool | None = None,
+        read_only: bool = False,
+        session_config: PostgresSessionConfig | None = None,
+        account: str | None = None,
+        lakebase_config: Any = None,
+        storage_class: str | None = None,
+        lakebase_endpoint: Mapping[str, str] | None = None,
+        cold_start_connector: Any = None,
     ) -> None:
+        if kind not in ("postgres", "lakebase", "starrocks", "cube"):
+            raise ValueError(f"Unsupported DBAPIAdapter kind: '{kind}'")
         self._connect = connect
         self._kind = kind
         self._before_connect = before_connect
         self._pool = pool
+        self._read_only = bool(read_only)
+        self._session_config = session_config
+        self._account = account
+        self._lakebase_config = lakebase_config
+        self._cold_start_connector = (
+            cold_start_connector
+            if cold_start_connector is not None
+            else getattr(connect, "cold_start_connector", None)
+        )
+        self.storage_class: str | None = storage_class
+        self.lakebase_endpoint: dict[str, str] | None = (
+            dict(lakebase_endpoint)
+            if lakebase_endpoint is not None
+            else (
+                {
+                    "project_id": str(lakebase_config.project_id),
+                    "branch_id": str(lakebase_config.branch_id),
+                    "endpoint_id": str(lakebase_config.endpoint_id),
+                    "endpoint_type": str(lakebase_config.endpoint_type),
+                }
+                if (
+                    kind == "lakebase"
+                    and lakebase_config is not None
+                    and hasattr(lakebase_config, "project_id")
+                    and hasattr(lakebase_config, "branch_id")
+                    and hasattr(lakebase_config, "endpoint_id")
+                    and hasattr(lakebase_config, "endpoint_type")
+                )
+                else None
+            )
+        )
+        self.last_cold_start: bool | None = None
 
     @property
-    def pool(self) -> LakebasePool | None:
-        """Return the underlying Lakebase connection pool, if configured."""
+    def kind(self) -> str:
+        return self._kind
+
+    @property
+    def pool(self) -> PostgresPool | None:
+        """Return the underlying PostgreSQL-wire connection pool, if configured."""
         return self._pool
 
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    @property
+    def session_config(self) -> PostgresSessionConfig | None:
+        return self._session_config
+
+    @property
+    def account(self) -> str | None:
+        return self._account
+
+    @account.setter
+    def account(self, value: str | None) -> None:
+        self._account = value
+
     def pool_stats(self) -> dict[str, int] | None:
-        """Return read-only Lakebase connection pool counts, or None when unpooled."""
+        """Return read-only PostgreSQL-wire connection pool counts, or None when unpooled."""
         if self._pool is None:
             return None
         return self._pool.stats()
 
+    def measure_snapshot_freshness(self) -> float | None:
+        """Measure read-only Lakebase snapshot freshness in seconds via the adapter."""
+        if self._kind != "lakebase" or self._lakebase_config is None:
+            return None
+        if self._pool is not None:
+            conn = self._pool.acquire()
+            ok = False
+            try:
+                lag = snapshot_freshness(conn, self._lakebase_config)
+                if hasattr(conn, "rollback") and callable(conn.rollback):
+                    conn.rollback()
+                ok = True
+                return lag
+            finally:
+                self._pool.release(conn, success=ok)
+        conn = self._connect()
+        try:
+            return snapshot_freshness(conn, self._lakebase_config)
+        finally:
+            if hasattr(conn, "close") and callable(conn.close):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     def close(self) -> None:
         if self._pool is not None:
             self._pool.close()
+        if (
+            self._cold_start_connector is not None
+            and hasattr(self._cold_start_connector, "close")
+            and callable(self._cold_start_connector.close)
+        ):
+            self._cold_start_connector.close()
 
     def check_health(self, timeout_seconds: float = 2.0) -> bool:
-        """Probe engine reachability via a short-lived direct connection outside the query pool."""
+        """Probe engine reachability without waking suspended Lakebase cold-start endpoints."""
         try:
             if (
                 isinstance(timeout_seconds, bool)
@@ -1414,6 +1548,19 @@ class DBAPIAdapter:
                 or math.isinf(timeout_seconds)
                 or timeout_seconds <= 0
             ):
+                return False
+
+            if self._cold_start_connector is not None:
+                if self._pool is not None and getattr(self._pool, "_closed", False):
+                    return False
+                st = getattr(self._cold_start_connector, "state", "unavailable")
+                if st == "ok":
+                    return True
+                if st == "starting":
+                    return False
+                probe_fn = getattr(self._cold_start_connector, "probe_no_wake", None)
+                if callable(probe_fn):
+                    return probe_fn(timeout_seconds=timeout_seconds) == "ok"
                 return False
 
             if self._before_connect is not None:
@@ -1483,6 +1630,8 @@ class DBAPIAdapter:
             )
         if self._kind == "cube" and prepared.cube_security_context is None:
             raise EngineError("Cube engine query requires cube_security_context")
+        if self._read_only and prepared.row_limit is None:
+            raise EngineError("Cannot execute write statement on read-only source")
 
         if self._before_connect is not None:
             try:
@@ -1493,7 +1642,39 @@ class DBAPIAdapter:
 
         start = time.perf_counter()
         conn = None
-        conn_is_pooled = (self._kind == "lakebase" and self._pool is not None)
+        has_cs_connector = (
+            self._kind == "lakebase" and self._cold_start_connector is not None
+        )
+        if has_cs_connector:
+            reset_fn = getattr(
+                self._cold_start_connector, "reset_thread_cold_start", None
+            )
+            if callable(reset_fn):
+                reset_fn()
+            query_cold_start: bool | None = False
+            self.last_cold_start = False
+        else:
+            query_cold_start = None
+            self.last_cold_start = None
+        is_pg_wire = is_postgres_wire(self._kind)
+        conn_is_pooled = is_pg_wire and self._pool is not None
+        hardened_pg = (
+            self._kind == "postgres"
+            or self._session_config is not None
+            or self._read_only
+        )
+        req_timeout_ms = max(1, int(round(timeout_seconds * 1000)))
+        effective_timeout_ms = (
+            min(req_timeout_ms, int(self._session_config.statement_timeout_ms))
+            if self._session_config is not None
+            else req_timeout_ms
+        )
+        workload_label = (
+            getattr(prepared, "workload", None)
+            or self._account
+            or "interactive"
+        )
+        has_row_limit = prepared.row_limit is not None
         query_success = False
         cursor = None
         cancel_event = threading.Event()
@@ -1504,10 +1685,30 @@ class DBAPIAdapter:
         cube_timer: threading.Timer | None = None
 
         if conn_is_pooled:
+            query_deadline = time.monotonic() + float(timeout_seconds)
             max_attempts = 2
             for attempt in range(max_attempts):
                 try:
-                    conn = self._pool.acquire()
+                    conn = self._pool.acquire(deadline=query_deadline)
+                    if has_cs_connector:
+                        consume_fn = getattr(
+                            self._cold_start_connector,
+                            "consume_thread_cold_start",
+                            None,
+                        )
+                        if callable(consume_fn):
+                            woke = consume_fn()
+                            if woke is True:
+                                query_cold_start = True
+                        elif bool(
+                            getattr(
+                                self._cold_start_connector,
+                                "last_cold_start",
+                                False,
+                            )
+                        ):
+                            query_cold_start = True
+                        self.last_cold_start = query_cold_start
                     cursor = conn.cursor()
 
                     def cancel_lb() -> None:
@@ -1525,11 +1726,15 @@ class DBAPIAdapter:
                     if on_cancel_handle is not None:
                         on_cancel_handle(cancel_lb)
 
-                    timeout_ms = max(1, int(round(timeout_seconds * 1000)))
-                    cursor.execute("BEGIN")
-                    if prepared.row_limit is not None:
-                        cursor.execute("SET TRANSACTION READ ONLY")
-                    cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+                    begin_query_transaction(
+                        cursor,
+                        read_only=self._read_only,
+                        timeout_ms=effective_timeout_ms,
+                        workload=workload_label,
+                        audit_id=prepared.audit_id,
+                        hardened=hardened_pg,
+                        has_row_limit=has_row_limit,
+                    )
                     break
                 except EnginePoolExhausted:
                     raise
@@ -1543,6 +1748,31 @@ class DBAPIAdapter:
                     if conn is not None:
                         self._pool.release(conn, success=False)
                         conn = None
+                    if (
+                        isinstance(exc, EngineStartingError)
+                        or getattr(exc, "code", None) == "engine_starting"
+                    ):
+                        if has_cs_connector:
+                            self.last_cold_start = True
+                        raise
+                    if has_cs_connector:
+                        consume_fn = getattr(
+                            self._cold_start_connector,
+                            "consume_thread_cold_start",
+                            None,
+                        )
+                        if callable(consume_fn) and consume_fn() is True:
+                            self.last_cold_start = True
+                    if isinstance(exc, PostgresSessionHardeningError) or (
+                        isinstance(exc, EngineError)
+                        and (
+                            "Role guard refused connection" in str(exc)
+                            or "Session hardening" in str(exc)
+                            or "authentication" in str(exc).lower()
+                            or "TLS verification" in str(exc)
+                        )
+                    ):
+                        raise
                     if attempt < max_attempts - 1:
                         continue
                     logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
@@ -1550,7 +1780,49 @@ class DBAPIAdapter:
         else:
             try:
                 conn = self._connect()
+                if has_cs_connector:
+                    consume_fn = getattr(
+                        self._cold_start_connector,
+                        "consume_thread_cold_start",
+                        None,
+                    )
+                    if callable(consume_fn):
+                        query_cold_start = bool(consume_fn())
+                    else:
+                        query_cold_start = bool(
+                            getattr(
+                                self._cold_start_connector,
+                                "last_cold_start",
+                                False,
+                            )
+                        )
+                    self.last_cold_start = query_cold_start
             except Exception as exc:
+                if (
+                    isinstance(exc, EngineStartingError)
+                    or getattr(exc, "code", None) == "engine_starting"
+                ):
+                    if has_cs_connector:
+                        self.last_cold_start = True
+                    raise
+                if has_cs_connector:
+                    consume_fn = getattr(
+                        self._cold_start_connector,
+                        "consume_thread_cold_start",
+                        None,
+                    )
+                    if callable(consume_fn) and consume_fn() is True:
+                        self.last_cold_start = True
+                if isinstance(exc, PostgresSessionHardeningError) or (
+                    isinstance(exc, EngineError)
+                    and (
+                        "Role guard refused connection" in str(exc)
+                        or "Session hardening" in str(exc)
+                        or "authentication" in str(exc).lower()
+                        or "TLS verification" in str(exc)
+                    )
+                ):
+                    raise
                 logger.error("engine=%s error=%s audit_id=%s", self._kind, type(exc).__name__, prepared.audit_id)
                 raise EngineError("Engine connection failed") from exc
 
@@ -1601,7 +1873,7 @@ class DBAPIAdapter:
                         timeout_s = max(1, int(round(timeout_seconds)))
                         cursor.execute(f"SET query_timeout = {timeout_s}")
 
-                    elif self._kind == "lakebase":
+                    elif is_pg_wire:
                         def cancel_lb_unpooled() -> None:
                             nonlocal cancel_called
                             with cancel_lock:
@@ -1617,11 +1889,15 @@ class DBAPIAdapter:
                         if on_cancel_handle is not None:
                             on_cancel_handle(cancel_lb_unpooled)
 
-                        timeout_ms = max(1, int(round(timeout_seconds * 1000)))
-                        cursor.execute("BEGIN")
-                        if prepared.row_limit is not None:
-                            cursor.execute("SET TRANSACTION READ ONLY")
-                        cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+                        begin_query_transaction(
+                            cursor,
+                            read_only=self._read_only,
+                            timeout_ms=effective_timeout_ms,
+                            workload=workload_label,
+                            audit_id=prepared.audit_id,
+                            hardened=hardened_pg,
+                            has_row_limit=has_row_limit,
+                        )
 
                     elif self._kind == "cube":
                         def cancel_cube() -> None:
@@ -1728,6 +2004,7 @@ class DBAPIAdapter:
             engine=prepared.engine,
             elapsed_ms=elapsed_ms,
             column_types=column_types,
+            cold_start=query_cold_start,
         )
 
 
@@ -1744,6 +2021,10 @@ class CubeAdapter:
         self._connect = connect
         self._security = security
         self._connect_timeout_seconds = connect_timeout_seconds
+        self.storage_class: str | None = None
+        self.account: str | None = None
+        self.lakebase_endpoint: dict[str, str] | None = None
+        self.last_cold_start: bool | None = None
 
     def execute(
         self,
@@ -1873,8 +2154,63 @@ class CubeAdapter:
 class WorkloadRoutedAdapter:
     """Adapter that delegates to another adapter based on prepared.workload."""
 
-    def __init__(self, by_workload: Mapping[str, EngineAdapter]) -> None:
+    def __init__(
+        self,
+        by_workload: Mapping[str, EngineAdapter],
+        *,
+        storage_class: str | None = None,
+        lakebase_endpoint: Mapping[str, str] | None = None,
+    ) -> None:
         self.by_workload = dict(by_workload)
+        self._storage_class: str | None = storage_class
+        self._lakebase_endpoint: dict[str, str] | None = (
+            dict(lakebase_endpoint) if lakebase_endpoint is not None else None
+        )
+        self.account: str | None = (
+            "interactive"
+            if "interactive" in self.by_workload
+            else (next(iter(self.by_workload)) if self.by_workload else None)
+        )
+        self.last_cold_start: bool | None = None
+        if self._storage_class is not None:
+            for sub in self.by_workload.values():
+                setattr(sub, "storage_class", self._storage_class)
+        if self._lakebase_endpoint is not None:
+            for sub in self.by_workload.values():
+                setattr(sub, "lakebase_endpoint", dict(self._lakebase_endpoint))
+
+    @property
+    def storage_class(self) -> str | None:
+        return self._storage_class
+
+    @storage_class.setter
+    def storage_class(self, value: str | None) -> None:
+        self._storage_class = value
+        for sub in self.by_workload.values():
+            setattr(sub, "storage_class", value)
+
+    @property
+    def lakebase_endpoint(self) -> dict[str, str] | None:
+        return self._lakebase_endpoint
+
+    @lakebase_endpoint.setter
+    def lakebase_endpoint(self, value: dict[str, str] | None) -> None:
+        self._lakebase_endpoint = dict(value) if value is not None else None
+        for sub in self.by_workload.values():
+            setattr(
+                sub,
+                "lakebase_endpoint",
+                dict(value) if value is not None else None,
+            )
+
+    def close(self) -> None:
+        seen_ids: set[int] = set()
+        for sub in self.by_workload.values():
+            if id(sub) in seen_ids:
+                continue
+            seen_ids.add(id(sub))
+            if hasattr(sub, "close") and callable(sub.close):
+                sub.close()
 
     def execute(
         self,
@@ -1888,24 +2224,36 @@ class WorkloadRoutedAdapter:
             raise EngineConfigError(
                 f"no engine account configured for workload '{prepared.workload}'"
             )
+        self.account = prepared.workload
         sig = inspect.signature(adapter.execute)
-        if "on_cancel_handle" in sig.parameters:
-            return adapter.execute(
-                prepared,
-                timeout_seconds=timeout_seconds,
-                on_cancel_handle=on_cancel_handle,
-            )
-        return adapter.execute(prepared, timeout_seconds=timeout_seconds)
+        try:
+            if "on_cancel_handle" in sig.parameters:
+                return adapter.execute(
+                    prepared,
+                    timeout_seconds=timeout_seconds,
+                    on_cancel_handle=on_cancel_handle,
+                )
+            return adapter.execute(prepared, timeout_seconds=timeout_seconds)
+        finally:
+            self.last_cold_start = getattr(adapter, "last_cold_start", None)
 
 
 def build_workload_adapters(
     kind: str,
-    connects: Mapping[str, Callable[[], Any]],
+    connects: Mapping[str, Callable[..., Any]],
+    *,
+    pools: Mapping[str, PostgresPool] | None = None,
     **kw: Any,
 ) -> WorkloadRoutedAdapter:
     """Build a WorkloadRoutedAdapter for a given engine kind across workloads."""
     by_workload = {
-        w: build_adapter(kind, conn, **kw)
+        w: build_adapter(
+            kind,
+            conn,
+            pool=pools.get(w) if pools is not None else kw.get("pool"),
+            account=w,
+            **{k: v for k, v in kw.items() if k not in ("pool", "account")},
+        )
         for w, conn in connects.items()
     }
     return WorkloadRoutedAdapter(by_workload)
@@ -1916,7 +2264,10 @@ def build_adapter(
     connect: Callable[..., Any] | None = None,
     *,
     config: Any = None,
-    pool: LakebasePool | None = None,
+    pool: PostgresPool | None = None,
+    read_only: bool = False,
+    session_config: PostgresSessionConfig | None = None,
+    account: str | None = None,
     **kw: Any,
 ) -> EngineAdapter:
     """Small factory to build an engine adapter for a given engine kind."""
@@ -1927,8 +2278,16 @@ def build_adapter(
             security = kw.pop("security")
             return CubeAdapter(connect, security=security, **kw)
         return DBAPIAdapter(connect, kind=kind, **kw)
-    if kind == "lakebase":
-        return DBAPIAdapter(connect, kind=kind, pool=pool, **kw)
+    if kind in ("postgres", "lakebase"):
+        return DBAPIAdapter(
+            connect,
+            kind=kind,
+            pool=pool,
+            read_only=read_only,
+            session_config=session_config,
+            account=account,
+            **kw,
+        )
     if kind == "starrocks":
-        return DBAPIAdapter(connect, kind=kind, **kw)
+        return DBAPIAdapter(connect, kind=kind, account=account, **kw)
     raise ValueError(f"Unsupported engine kind: '{kind}'")

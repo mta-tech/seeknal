@@ -186,6 +186,7 @@ def test_build_server_61s_refused_default_and_accepted_at_120(ec_key_pair, tmp_p
     server_default = build_server(
         base_config,
         connect_factories={"duck": lambda: duckdb.connect(str(db_file), read_only=True)},
+        cursor_key="test-grant-lifetime-cursor-key-32b",
     )
     # Inject loaded key for mock
     server_default.pipeline.public_keys = {"key-1": pub}
@@ -206,6 +207,7 @@ def test_build_server_61s_refused_default_and_accepted_at_120(ec_key_pair, tmp_p
     server_120 = build_server(
         cfg_120,
         connect_factories={"duck": lambda: duckdb.connect(str(db_file), read_only=True)},
+        cursor_key="test-grant-lifetime-cursor-key-32b",
     )
     server_120.pipeline.public_keys = {"key-1": pub}
     client_120 = TestClient(server_120.app)

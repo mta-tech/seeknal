@@ -718,3 +718,56 @@ def test_http_query_and_explain_reject_table_functions_across_all_engines(
     assert body["audit_id"] == jti
     assert "s3://bucket" not in resp.text
 
+
+def test_postgres_wire_writability_and_preference_in_router():
+    placement = Placement.from_dict(
+        {
+            "engines": {
+                "lb": {"kind": "lakebase", "dialect": "postgres"},
+                "pg_ro": {"kind": "postgres", "dialect": "postgres"},
+                "duck": {"kind": "duckdb", "dialect": "duckdb"},
+            },
+            "tables": {
+                "orders": {
+                    "keys": ["id"],
+                    "row_count": 200,
+                    "serve": {
+                        "lb": "public.orders",
+                        "pg_ro": "rpt.orders",
+                        "duck": "orders",
+                    },
+                },
+                "ro_only": {
+                    "keys": ["id"],
+                    "row_count": 50,
+                    "serve": {"pg_ro": "rpt.ro_only"},
+                },
+            },
+        }
+    )
+    r = Router(placement)
+
+    # Read point_lookup prefers 'postgres' over 'lakebase' even when 'lb' is declared first
+    d_pt = r.route("SELECT * FROM orders WHERE id = 1")
+    assert d_pt.engine == "pg_ro"
+    assert d_pt.rule == "point_lookup"
+
+    # Read small_scan prefers 'postgres' over 'lakebase'
+    d_scan = r.route("SELECT * FROM orders")
+    assert d_scan.engine == "pg_ro"
+    assert d_scan.rule == "small_scan"
+
+    # Write goes to writable 'lb' (skipping read-only 'pg_ro')
+    d_wr = r.route("INSERT INTO orders (id) VALUES (1)")
+    assert d_wr.engine == "lb"
+    assert d_wr.rule == "write"
+
+    # Write to table only on read-only Postgres raises RoutingError before any connection
+    with pytest.raises(RoutingError, match="not writable|no feasible writable"):
+        r.route("INSERT INTO ro_only (id) VALUES (1)")
+
+    # Hinted write to read-only Postgres raises RoutingError
+    with pytest.raises(RoutingError, match="not writable"):
+        r.route("INSERT INTO orders (id) VALUES (1)", hint="pg_ro")
+
+

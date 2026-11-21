@@ -6,8 +6,8 @@ Seeknal Serving operates as a SQL gateway that accepts standard PostgreSQL SQL s
 
 - **StarRocks**: High-performance analytical processing over large tables (aggregations, multi-table joins, window functions, and large scans).
 - **Cube SQL API**: Slice-and-dice semantic queries over predefined Cube cubes and views (semantic layer, pre-aggregations).
-- **Lakebase** (PostgreSQL): Transactional workloads, including data mutations (writes) and indexed point lookups by primary key.
-- **DuckDB**: Fast, in-process engine used as a local fallback for development, testing, and lightweight scans.
+- **PostgreSQL (`postgres`) & Lakebase (`lakebase`)**: Postgres-wire operational stores (`is_postgres_wire`) for indexed point lookups (`point`), selective indexed range/equality queries (`filter`), and—when configured writable (`mode: read_write` on `postgres`, or default `endpoint_type: read_write` on `lakebase`)—transactional writes.
+- **DuckDB**: Fast columnar engine (local file or `iceberg_direct`) for analytical scans, aggregations, and lightweight queries.
 
 The G1 milestone delivers the routing core as a pure Python library. It performs structural AST analysis using `sqlglot`, determines engine feasibility and routing policies, and transpiles table references and SQL syntax without establishing network connections or running queries.
 
@@ -67,25 +67,33 @@ policy:
 ### Key Principles
 
 - **Logical Name Resolution**: Lookup is case-insensitive. Logical names can be qualified (`claims.claim`). References match entries with the exact same qualification after lower-casing; no default schema is guessed.
-- **Engines**: Must have one of the valid kinds: `starrocks`, `cube`, `lakebase`, or `duckdb`.
-- **Serves**: A table serve specifies the target engine and physical table name (either as a string or a mapping containing `name` and optional `max_lag_seconds`).
+- **Engines**: Must have one of the valid kinds: `starrocks`, `cube`, `lakebase`, `postgres`, or `duckdb`. Postgres-wire engines accept optional `mode` (`read_only` or `read_write`, or `endpoint_type` as alias): `postgres` defaults to `read_only` (`is_writable == False`), while `lakebase` defaults to `read_write` (`is_writable == True`). Note that `storage_class` is declared on `connections.<name>`, never inside `placement.engines`.
+- **Serves**: A table serve specifies the target engine and physical table name (either as a string or a mapping containing `name`, optional `max_lag_seconds`, and optional `snapshot_id`).
+- **Access Metadata**: Tables may declare `access` (`TableAccess`: `pattern`, `keys`, `filterable`, `range_filterable`, `prefix_filterable`, `sortable`, `require_filter`, `max_rows`) and `tokenized: true|false`; see [access-patterns.md](access-patterns.md).
 - **Validation**: `PlacementError` is raised with a message identifying the offending entry if unknown engine kinds are supplied, undefined engines are referenced, cubes use non-cube engines, tables lack serves, names are empty, or logical names collide case-insensitively.
 
 ---
 
 ## Routing Rules and Policies
 
-The router evaluates incoming statements through an ordered pipeline of rules, picking the first matching rule.
+The router evaluates incoming statements through an ordered pipeline of rules, picking the first matching rule:
+1. `hint` (explicit argument or leading `/* seeknal:engine=... */` comment)
+2. `write`
+3. `semantic`
+4. `point_lookup`
+5. `filter`
+6. `analytics`
+7. `small_scan`
 
 ### 1. `write`
 - **Condition**: Mutation statements (`INSERT`, `UPDATE`, `DELETE`, or `MERGE`).
-- **Engine Selection**: The first feasible engine of kind `lakebase`. If none is available, raises `RoutingError`.
+- **Engine Selection**: A feasible **writable** Postgres-wire engine (`engine.is_writable`, preferring `postgres` with `mode: read_write` before `lakebase`, then placement order). Writes to tables served only on read-only Postgres-wire engines or non-Postgres engines raise `RoutingError` before any connection is opened.
 - **Example Statement**:
   ```sql
   INSERT INTO ref.province (province_code) VALUES ('ON')
   ```
 - **Selected Engine**: `lb` (Lakebase).
-- **Reason**: Transactional mutations require transactional consistency provided by Lakebase.
+- **Reason**: Transactional mutations require a writable Postgres-wire engine.
 
 ### 2. `semantic`
 - **Condition**: The statement references a semantic cube defined in `cubes`.
@@ -100,18 +108,24 @@ The router evaluates incoming statements through an ordered pipeline of rules, p
 ### 3. `point_lookup`
 - **Condition**: A `SELECT` query meeting all criteria:
   - References exactly one table with at least one defined key.
-  - Contains no aggregations, `GROUP BY`, window functions, joins, or subqueries.
-  - Every key column of the table is constrained in the outermost `WHERE` clause by top-level equality (`key = <val>`) or `IN (<val1>, ...)` conjuncts.
+  - Contains no aggregations, `GROUP BY`, window functions, or joins (1-level plain-projection derived tables are transparent).
+  - Every key column of the table is constrained by sargable equality (`key = <val>`) or `IN (<val1>, ...)` conjuncts ($\le$ `max_in_list`).
   - The product of allowable key values is $\le$ `point_lookup_max_keys` (default: 100).
-- **Engine Selection**: The first feasible engine of kind `lakebase`. If Lakebase is infeasible (or rejected due to staleness), falls through to subsequent rules (`analytics` or `small_scan`).
+- **Engine Selection**: A feasible Postgres-wire engine, preferring `postgres` over `lakebase` on ties, then placement order. If none is feasible, falls through to subsequent rules.
 - **Example Statement**:
   ```sql
   SELECT * FROM claims.claim WHERE claim_id = 42
   ```
-- **Selected Engine**: `lb` (Lakebase).
+- **Selected Engine**: `lb` (or `pg` when a `postgres` source also serves the table).
 - **Reason**: `"filters claim_id by 1 value on table claims.claim"`.
 
-### 4. `analytics`
+### 4. `filter`
+- **Condition**: A `SELECT` query with no aggregate functions, `GROUP BY`, window functions, or `DISTINCT`, when:
+  - A feasible Postgres-wire source serves every referenced table; and
+  - At least one top-level sargable conjunct constrains a `filterable`, `range_filterable` (`>`, `>=`, `<`, `<=`, `BETWEEN`), or `prefix_filterable` (`LIKE 'prefix%'`) column of a referenced table (within `max_in_list`).
+- **Engine Selection**: A feasible Postgres-wire engine, preferring `postgres` before `lakebase` on ties, then placement order. Aggregates and `DISTINCT` queries on mirrored tables skip `filter` and continue to `analytics`.
+
+### 5. `analytics`
 - **Condition**:
   - The query contains any aggregate function, `GROUP BY`, window function, join, or `DISTINCT`; **OR**
   - Any referenced table has an unknown `row_count` or `row_count` $\ge$ `analytics_min_rows` (default: 1,000,000).
@@ -124,17 +138,17 @@ The router evaluates incoming statements through an ordered pipeline of rules, p
   SELECT * FROM claims.claim WHERE status = 'pending'
   ```
 - **Selected Engine**: `sr` (StarRocks).
-- **Reason**: Heavy aggregations and large table scans are routed to StarRocks for distributed OLAP execution.
+- **Reason**: Heavy aggregations and large table scans are routed to StarRocks or DuckDB for columnar execution.
 
-### 5. `small_scan`
+### 6. `small_scan`
 - **Condition**: Statements that do not match prior rules (e.g., non-keyed scans over small reference tables).
-- **Engine Selection**: The first feasible engine matching `small_scan_order` (default: `("lakebase", "starrocks", "duckdb")`).
+- **Engine Selection**: The first feasible engine matching `small_scan_order` (default: `("lakebase", "starrocks", "duckdb")`, where `"lakebase"` matches `"postgres"` first and then `"lakebase"`).
 - **Example Statement**:
   ```sql
   SELECT * FROM ref.province
   ```
-- **Selected Engine**: `lb` (Lakebase).
-- **Reason**: Lightweight scans over small reference tables run efficiently on Lakebase or DuckDB without analytical cluster overhead.
+- **Selected Engine**: `lb` (or `pg`).
+- **Reason**: Lightweight scans over small reference tables run efficiently on Postgres-wire or DuckDB without analytical cluster overhead.
 
 ### Rule Fallback Preference
 If a matched rule's preferred engine order yields no feasible engine, the router evaluates remaining rules' preference orders before raising `RoutingError`.

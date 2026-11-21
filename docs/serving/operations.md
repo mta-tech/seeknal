@@ -8,7 +8,7 @@ Seeknal Serving separates tenant-facing query traffic from operational telemetry
 
 | Listener | Default Bind | Default Endpoints | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Public Serving App** | `0.0.0.0:8765` | `POST /v1/query`, `POST /v1/explain`, `POST /v1/cancel`, `GET /healthz`, `GET /readyz` | Policy-enforced query execution for grant-bearing callers and load-balancer health checks |
+| **Public Serving App** | `0.0.0.0:8765` | `POST /v1/query`, `POST /v1/select`, `POST /v1/explain`, `POST /v1/cancel`, `GET /healthz`, `GET /readyz` | Policy-enforced query execution for grant-bearing callers and load-balancer health checks |
 | **Operations App (`ops`)** | `127.0.0.1:9090` | `GET /healthz`, `GET /readyz`, `GET /metrics`, `GET /buildinfo` | Prometheus scraping, deep readiness inspection, and build provenance |
 
 - When the `ops:` section is omitted (or `null`) in `serving.yaml`, `ServerConfig.ops` is `None` (the operations listener is off, `/readyz` remains enabled on the public port, and `/metrics` and `/buildinfo` remain disabled on the public port).
@@ -126,19 +126,20 @@ Both listeners execute the full catalog and engine reachability checks (returnin
 }
 ```
 
-  - **HTTP 503 (one or more engines unreachable or timed out):**
+  - **HTTP 503 (one or more engines starting, unreachable, or timed out):**
 
 ```json
 {
   "ready": false,
   "engines": {
     "duck": "ok",
-    "lakebase": "unavailable"
+    "pg_report": "ok",
+    "lb_ops": "starting"
   }
 }
 ```
 
-`/readyz` responses never contain exception messages, database DSNs, credentials, or internal hostnames.
+Per-engine status values are bounded strictly to `"ok"`, `"starting"` (when a Lakebase `ColdStartConnector` wake/retry is actively in flight), or `"unavailable"`. `/readyz` responses never contain exception messages, database DSNs, credentials, or internal hostnames.
 
 ### `GET /buildinfo` — Build Provenance
 
@@ -166,10 +167,19 @@ Emits `text/plain; version=0.0.4; charset=utf-8` using standard library formatti
 | `seeknal_serving_duckdb_queue_depth` | `gauge` | `engine` | Number of requests waiting to acquire a DuckDB cursor slot. |
 | `seeknal_serving_duckdb_in_flight_cursors` | `gauge` | `engine` | Number of currently active DuckDB cursor slots. |
 | `seeknal_serving_duckdb_generation` | `gauge` | `engine` | Current DuckDB holder instance generation (read non-destructively without opening a connection). |
-| `seeknal_serving_lakebase_pool_in_use` | `gauge` | `engine` | Borrowed connections currently in use in the Lakebase pool. |
-| `seeknal_serving_lakebase_pool_idle` | `gauge` | `engine` | Available idle connections in the Lakebase pool. |
+| `seeknal_serving_postgres_pool_in_use` | `gauge` | `engine`, `kind`, `account` | Active borrowed connections in the shared Postgres-wire pool (`kind` in `postgres\|lakebase`, `account` in `interactive\|bi\|report\|ask\|job\|default`). |
+| `seeknal_serving_postgres_pool_idle` | `gauge` | `engine`, `kind`, `account` | Available idle connections in the shared Postgres-wire pool. |
+| `seeknal_serving_lakebase_pool_in_use` | `gauge` | `engine` | *Deprecated duplicate* of `seeknal_serving_postgres_pool_in_use` (retained for one release). |
+| `seeknal_serving_lakebase_pool_idle` | `gauge` | `engine` | *Deprecated duplicate* of `seeknal_serving_postgres_pool_idle` (retained for one release). |
 | `seeknal_serving_grants_rejected_total` | `counter` | `reason` | Total rejected grant/cancel tokens by bounded reason (`expired`, `invalid_signature`, `malformed`, `replayed`, `untrusted_kid`, `invalid_claims`, `lifetime_exceeded`, `other`). |
 | `seeknal_serving_audit_write_failures_total` | `counter` | *(none)* | Total audit log write failures. |
+| `seeknal_serving_guard_rejections_total` | `counter` | `code` | Total access guardrail rejections by bounded code (`filter_required`, `sort_not_indexed`, `offset_too_large`, `other`). |
+| `seeknal_serving_sync_lag_seconds` | `gauge` | `engine` | Observed data-level freshness lag in seconds per engine. |
+| `seeknal_serving_discovery_refresh_total` | `counter` | `engine`, `outcome` | Total discovery refresh outcomes per engine (`success`, `error`). |
+| `seeknal_serving_lakebase_wake_total` | `counter` | `engine`, `outcome` | Total Lakebase control-plane wake operations (`ok`, `success`, `error`, `timeout`). |
+| `seeknal_serving_lakebase_connect_retries_total` | `counter` | `engine` | Total bounded connection retries during Lakebase cold start. |
+| `seeknal_serving_lakebase_cold_start_seconds` | `histogram` | `engine`, `le` | Lakebase cold-start resume duration distribution in seconds. |
+| `seeknal_serving_lakebase_state` | `gauge` | `engine`, `state` | State-set gauge (`state` in `ok`, `starting`, `unavailable`; `1` for active state, `0` otherwise). |
 
 ---
 
@@ -177,7 +187,7 @@ Emits `text/plain; version=0.0.4; charset=utf-8` using standard library formatti
 
 `MetricsRegistry` enforces strict allowlists on every label before recording:
 
-- **`route`:** Must be one of `("/v1/query", "/v1/explain", "/v1/cancel", "/healthz", "/readyz", "/metrics", "/buildinfo")`; anything else maps to `"other"`.
+- **`route`:** Must be one of `("/v1/query", "/v1/select", "/v1/explain", "/v1/cancel", "/healthz", "/readyz", "/metrics", "/buildinfo")`; anything else maps to `"other"`.
 - **`engine`:** Must match a configured safe engine identifier; unknown or unrouted requests map to `"none"`.
 - **`status`:** Must be an HTTP status code in `100..599`; invalid values map to `"unknown"`.
 - **`code`:** Must belong to the bounded typed error code allowlist; unmapped values map to `"internal_error"`.

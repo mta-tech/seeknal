@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
+import logging
 import math
 import os
 from collections.abc import Mapping, Sequence
@@ -30,6 +32,43 @@ from seeknal.serving.errors import register_config_secrets
 from seeknal.serving.grant_token import _load_public_key
 from seeknal.serving.ops import OpsConfig
 from seeknal.serving.placement import Placement, PlacementError, UniqueKeySafeLoader
+from seeknal.serving.lakebase_endpoint import (
+    DEFAULT_DENY_ROLES,
+    effective_storage_class,
+    parse_lakebase_block,
+    validate_deny_roles,
+)
+from seeknal.serving.postgres_session import (
+    PostgresAccountConfig,
+    PostgresFreshnessConfig,
+    PostgresSessionConfig,
+    PostgresTLSConfig,
+    VALID_POSTGRES_MODES,
+    VALID_SSLMODES,
+)
+
+logger = logging.getLogger(__name__)
+
+VALID_WORKLOADS: frozenset[str] = frozenset(
+    {"interactive", "bi", "report", "ask", "job"}
+)
+VALID_STORAGE_CLASSES: frozenset[str] = frozenset({"local", "object_storage"})
+_FORBIDDEN_LITERAL_SECRET_KEYS: frozenset[str] = frozenset(
+    {
+        "dsn",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_token",
+        "uri",
+        "url",
+        "connection_string",
+    }
+)
+_QUALIFIED_SYNC_TABLE_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]{0,62}\.[A-Za-z_][A-Za-z0-9_]{0,62}$"
+)
 
 
 class ServerConfigError(Exception):
@@ -182,10 +221,24 @@ class PreflightResult:
     schemas: dict[str, list[str]] | None = None
 
 
+_B64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\Z")
+
+
 def _b64url_decode(s: str) -> bytes:
+    if not isinstance(s, str) or not s or not _B64URL_PATTERN.fullmatch(s):
+        raise ServerConfigError("Invalid base64url segment")
     rem = len(s) % 4
+    if rem == 1:
+        raise ServerConfigError("Invalid base64url segment")
     padded = s + ("=" * ((4 - rem) % 4))
-    return base64.urlsafe_b64decode(padded.encode("ascii"))
+    try:
+        data = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except Exception as exc:
+        raise ServerConfigError("Failed to decode base64url segment") from exc
+    canonical = base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+    if canonical != s:
+        raise ServerConfigError("Invalid base64url segment")
+    return data
 
 
 def parse_jwks(data_or_str: dict | list | str) -> dict[str, str]:
@@ -358,6 +411,659 @@ def check_and_parse_secrets_env_file(path: str) -> dict[str, str]:
     return result
 
 
+def _validate_optional_storage_class(
+    raw_val: Any,
+    context: str,
+    *,
+    forbid_local: bool = False,
+) -> str | None:
+    if raw_val is None:
+        return None
+    if not isinstance(raw_val, str) or raw_val.strip() not in VALID_STORAGE_CLASSES:
+        raise ServerConfigError(
+            f"{context} 'storage_class' must be 'local' or 'object_storage', "
+            f"got '{_safe_enum_token(raw_val)}'"
+        )
+    cleaned = raw_val.strip()
+    if forbid_local and cleaned == "local":
+        raise ServerConfigError(
+            f"{context} cannot set storage_class='local' (reads object storage)"
+        )
+    return cleaned
+
+
+def _validate_dsn_env_name(raw_val: Any, context: str) -> str:
+    if (
+        not isinstance(raw_val, str)
+        or not raw_val.strip()
+        or not _ENV_VAR_NAME_RE.fullmatch(raw_val.strip())
+    ):
+        raise ServerConfigError(
+            f"{context} 'dsn_env' must be a valid environment variable name "
+            f"matching ^[A-Za-z_][A-Za-z0-9_]{{0,127}}$"
+        )
+    return raw_val.strip()
+
+
+def _validate_dsn_file_path(raw_val: Any, desc: str) -> str:
+    if (
+        not isinstance(raw_val, str)
+        or not raw_val.strip()
+        or "://" in raw_val
+        or "@" in raw_val
+        or any(ord(ch) < 32 for ch in raw_val)
+    ):
+        raise ServerConfigError(
+            f"{desc} must be a non-empty filesystem path (never a literal DSN)"
+        )
+    path_str = raw_val.strip()
+    check_file_not_group_world_readable(path_str, desc)
+    return path_str
+
+
+def _check_no_literal_secrets(mapping_obj: Mapping[str, Any], context: str) -> None:
+    for raw_k in mapping_obj.keys():
+        k_low = str(raw_k).strip().lower()
+        if k_low in _FORBIDDEN_LITERAL_SECRET_KEYS:
+            raise ServerConfigError(
+                f"{context} forbids literal secret key '{k_low}'; "
+                f"reference environment variables or secret files instead"
+            )
+
+
+def _parse_postgres_session_block(
+    raw_session: Any, context: str
+) -> PostgresSessionConfig:
+    if not isinstance(raw_session, Mapping):
+        raise ServerConfigError(f"{context} 'session' must be a mapping")
+    _check_no_literal_secrets(raw_session, f"{context} 'session'")
+    allowed_session = {
+        "statement_timeout_ms",
+        "lock_timeout_ms",
+        "idle_in_transaction_session_timeout_ms",
+        "search_path",
+        "application_name",
+        "startup_options",
+        "connection_limit",
+    }
+    unknown_session = set(raw_session.keys()) - allowed_session
+    if unknown_session:
+        raise ServerConfigError(
+            f"Unknown key(s) in {context} 'session': "
+            f"{sorted(_safe_label(str(k)) for k in unknown_session)}"
+        )
+
+    def _pos_int(field_k: str, default_v: int) -> int:
+        v = raw_session.get(field_k, default_v)
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise ServerConfigError(
+                f"{context} 'session.{field_k}' must be a positive integer"
+            )
+        return v
+
+    stmt_ms = _pos_int("statement_timeout_ms", 30000)
+    lock_ms = _pos_int("lock_timeout_ms", 2000)
+    idle_ms = _pos_int("idle_in_transaction_session_timeout_ms", 10000)
+
+    sp_raw = raw_session.get("search_path", "pg_catalog")
+    if not isinstance(sp_raw, str) or not sp_raw.strip():
+        raise ServerConfigError(
+            f"{context} 'session.search_path' must be a non-empty string"
+        )
+
+    app_raw = raw_session.get("application_name", "seeknal-serving")
+    if (
+        not isinstance(app_raw, str)
+        or not app_raw.strip()
+        or any(ord(ch) < 32 for ch in app_raw)
+        or "://" in app_raw
+        or "@" in app_raw
+    ):
+        raise ServerConfigError(
+            f"{context} 'session.application_name' must be a safe non-empty string"
+        )
+
+    startup_opts = raw_session.get("startup_options", True)
+    if not isinstance(startup_opts, bool):
+        raise ServerConfigError(
+            f"{context} 'session.startup_options' must be a boolean"
+        )
+
+    conn_limit_raw = raw_session.get("connection_limit")
+    conn_limit: int | None = None
+    if conn_limit_raw is not None:
+        if (
+            isinstance(conn_limit_raw, bool)
+            or not isinstance(conn_limit_raw, int)
+            or conn_limit_raw <= 0
+        ):
+            raise ServerConfigError(
+                f"{context} 'session.connection_limit' must be a positive integer or null"
+            )
+        conn_limit = conn_limit_raw
+
+    try:
+        return PostgresSessionConfig(
+            statement_timeout_ms=stmt_ms,
+            lock_timeout_ms=lock_ms,
+            idle_in_transaction_session_timeout_ms=idle_ms,
+            search_path=sp_raw.strip(),
+            application_name=app_raw.strip(),
+            startup_options=startup_opts,
+            connection_limit=conn_limit,
+        )
+    except ValueError as exc:
+        raise ServerConfigError(f"Invalid {context} 'session': {exc}") from exc
+
+
+def _parse_postgres_tls_block(raw_tls: Any, context: str) -> PostgresTLSConfig:
+    if not isinstance(raw_tls, Mapping):
+        raise ServerConfigError(f"{context} 'tls' must be a mapping")
+    _check_no_literal_secrets(raw_tls, f"{context} 'tls'")
+    allowed_tls = {
+        "sslmode",
+        "sslrootcert_file",
+        "sslcert_file",
+        "sslkey_file",
+        "allow_insecure_tls",
+    }
+    unknown_tls = set(raw_tls.keys()) - allowed_tls
+    if unknown_tls:
+        raise ServerConfigError(
+            f"Unknown key(s) in {context} 'tls': "
+            f"{sorted(_safe_label(str(k)) for k in unknown_tls)}"
+        )
+
+    sslmode_raw = raw_tls.get("sslmode", "verify-full")
+    if not isinstance(sslmode_raw, str) or sslmode_raw.strip() not in VALID_SSLMODES:
+        raise ServerConfigError(
+            f"{context} 'tls.sslmode' must be one of {sorted(VALID_SSLMODES)}"
+        )
+    sslmode_clean = sslmode_raw.strip()
+
+    allow_insecure_tls = raw_tls.get("allow_insecure_tls", False)
+    if not isinstance(allow_insecure_tls, bool):
+        raise ServerConfigError(
+            f"{context} 'tls.allow_insecure_tls' must be a boolean"
+        )
+
+    file_vals: dict[str, str | None] = {}
+    for fk in ("sslrootcert_file", "sslcert_file", "sslkey_file"):
+        fv = raw_tls.get(fk)
+        if fv is None:
+            file_vals[fk] = None
+        else:
+            if (
+                not isinstance(fv, str)
+                or not fv.strip()
+                or "://" in fv
+                or any(ord(ch) < 32 for ch in fv)
+            ):
+                raise ServerConfigError(
+                    f"{context} 'tls.{fk}' must be a non-empty file path string"
+                )
+            file_vals[fk] = fv.strip()
+            if fk == "sslkey_file":
+                check_file_not_group_world_readable(
+                    file_vals[fk],  # type: ignore[arg-type]
+                    f"{context} tls.sslkey_file",
+                )
+
+    return PostgresTLSConfig(
+        sslmode=sslmode_clean,
+        sslrootcert_file=file_vals["sslrootcert_file"],
+        sslcert_file=file_vals["sslcert_file"],
+        sslkey_file=file_vals["sslkey_file"],
+        allow_insecure_tls=allow_insecure_tls,
+    )
+
+
+def _parse_postgres_freshness_block(
+    raw_fr: Any, context: str, *, default_sync_table: str | None = None
+) -> PostgresFreshnessConfig:
+    if not isinstance(raw_fr, Mapping):
+        raise ServerConfigError(f"{context} 'freshness' must be a mapping")
+    _check_no_literal_secrets(raw_fr, f"{context} 'freshness'")
+    unknown_fr = set(raw_fr.keys()) - {"sync_state_table", "freshness_sql"}
+    if unknown_fr:
+        raise ServerConfigError(
+            f"Unknown key(s) in {context} 'freshness': "
+            f"{sorted(_safe_label(str(k)) for k in unknown_fr)}"
+        )
+    sst_raw = raw_fr.get("sync_state_table", default_sync_table)
+    sst_clean: str | None = None
+    if sst_raw is not None:
+        if not isinstance(sst_raw, str) or not _QUALIFIED_SYNC_TABLE_RE.fullmatch(
+            sst_raw.strip()
+        ):
+            raise ServerConfigError(
+                f"{context} 'freshness.sync_state_table' must be schema-qualified '<schema>.<table>'"
+            )
+        sst_clean = sst_raw.strip()
+
+    fsql_raw = raw_fr.get("freshness_sql")
+    fsql_clean: str | None = None
+    if fsql_raw is not None:
+        if not isinstance(fsql_raw, str) or not fsql_raw.strip():
+            raise ServerConfigError(
+                f"{context} 'freshness.freshness_sql' must be a non-empty SQL string or null"
+            )
+        fsql_clean = fsql_raw.strip()
+
+    return PostgresFreshnessConfig(
+        sync_state_table=sst_clean,
+        freshness_sql=fsql_clean,
+    )
+
+
+def _invoke_parse_lakebase_block(raw_lb: Any, safe_eng: str) -> Any:
+    if not isinstance(raw_lb, Mapping):
+        raise ServerConfigError(
+            f"Lakebase connection '{safe_eng}' field 'lakebase' must be a mapping"
+        )
+    _check_no_literal_secrets(raw_lb, f"Lakebase connection '{safe_eng}' 'lakebase'")
+    if "storage_class" in raw_lb:
+        raise ServerConfigError(
+            f"Lakebase connection '{safe_eng}' cannot set 'storage_class' inside 'lakebase'"
+        )
+    cs_sub = raw_lb.get("cold_start")
+    if isinstance(cs_sub, Mapping):
+        _check_no_literal_secrets(
+            cs_sub, f"Lakebase connection '{safe_eng}' 'lakebase.cold_start'"
+        )
+
+    try:
+        sig = inspect.signature(parse_lakebase_block)
+        params = sig.parameters
+        has_varkw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        kw: dict[str, Any] = {}
+        if "eng_name" in params or has_varkw:
+            kw["eng_name"] = safe_eng
+        if "error_cls" in params or has_varkw:
+            kw["error_cls"] = ServerConfigError
+        return parse_lakebase_block(raw_lb, **kw)
+    except ServerConfigError:
+        raise
+    except Exception as exc:
+        msg = str(exc)
+        if _SUSPICIOUS_TOKEN_RE.search(msg):
+            msg = "invalid configuration value"
+        raise ServerConfigError(
+            f"Invalid 'lakebase' block in connection '{safe_eng}': {msg}"
+        ) from exc
+
+
+def _parse_postgres_wire_connection(
+    eng_name_str: str,
+    eng_spec: Mapping[str, Any],
+    *,
+    kind: str,
+) -> PostgresConnectionConfig | LakebaseConnectionConfig:
+    safe_eng = _safe_label(eng_name_str)
+    kind_title = "Postgres" if kind == "postgres" else "Lakebase"
+    ctx = f"{kind_title} connection '{safe_eng}'"
+
+    _check_no_literal_secrets(eng_spec, ctx)
+
+    allowed_keys = {
+        "kind",
+        "mode",
+        "dsn_env",
+        "dsn_file",
+        "accounts",
+        "pool_max",
+        "pool_min",
+        "connect_timeout_seconds",
+        "max_idle_seconds",
+        "max_lifetime_seconds",
+        "acquire_timeout_seconds",
+        "session",
+        "tls",
+        "role_guard",
+        "storage_class",
+        "freshness",
+    }
+    if kind == "lakebase":
+        allowed_keys.add("lakebase")
+
+    unknown = set(eng_spec.keys()) - allowed_keys
+    if unknown:
+        raise ServerConfigError(
+            f"Unknown key(s) in {kind} connection '{safe_eng}': "
+            f"{sorted(_safe_label(str(k)) for k in unknown)}"
+        )
+
+    has_lb_block = kind == "lakebase" and "lakebase" in eng_spec
+    lakebase_cfg: Any = None
+    if has_lb_block:
+        if "storage_class" in eng_spec:
+            raise ServerConfigError(
+                f"Lakebase connection '{safe_eng}' cannot set 'storage_class' (fixed to 'object_storage')"
+            )
+        lakebase_cfg = _invoke_parse_lakebase_block(eng_spec["lakebase"], safe_eng)
+
+    # Credential validation: exactly one of dsn_env XOR dsn_file XOR accounts
+    has_dsn_env = "dsn_env" in eng_spec
+    has_dsn_file = "dsn_file" in eng_spec
+    has_accounts = "accounts" in eng_spec
+    cred_count = int(has_dsn_env) + int(has_dsn_file) + int(has_accounts)
+    if cred_count > 1:
+        raise ServerConfigError(
+            f"{ctx} must specify exactly one of 'dsn_env', 'dsn_file', or 'accounts'"
+        )
+    if cred_count == 0:
+        raise ServerConfigError(
+            f"{ctx} missing required 'dsn_env' (specify exactly one of 'dsn_env', 'dsn_file', or 'accounts')"
+        )
+
+    dsn_env_clean = ""
+    dsn_file_clean: str | None = None
+    accounts_clean: dict[str, PostgresAccountConfig] = {}
+
+    if has_dsn_env:
+        dsn_env_clean = _validate_dsn_env_name(eng_spec["dsn_env"], ctx)
+    elif has_dsn_file:
+        dsn_file_clean = _validate_dsn_file_path(
+            eng_spec["dsn_file"], f"{ctx} dsn_file"
+        )
+    else:
+        accounts_raw = eng_spec["accounts"]
+        if not isinstance(accounts_raw, Mapping) or not accounts_raw:
+            raise ServerConfigError(
+                f"{ctx} must have a non-empty 'accounts' mapping"
+            )
+        invalid_accs = set(accounts_raw.keys()) - VALID_WORKLOADS
+        if invalid_accs:
+            raise ServerConfigError(
+                f"{ctx} contains invalid account(s): "
+                f"{sorted(_safe_label(str(a)) for a in invalid_accs)}"
+            )
+        if "interactive" not in accounts_raw:
+            raise ServerConfigError(
+                f"{ctx} accounts must contain at least 'interactive'"
+            )
+        for acc_name, acc_spec in accounts_raw.items():
+            if not isinstance(acc_spec, Mapping):
+                raise ServerConfigError(
+                    f"{ctx} account '{_safe_label(acc_name)}' must be a mapping"
+                )
+            acc_ctx = f"{ctx} account '{_safe_label(acc_name)}'"
+            _check_no_literal_secrets(acc_spec, acc_ctx)
+            unknown_acc = set(acc_spec.keys()) - {"dsn_env", "dsn_file"}
+            if unknown_acc:
+                raise ServerConfigError(
+                    f"Unknown key(s) in {acc_ctx}: "
+                    f"{sorted(_safe_label(str(k)) for k in unknown_acc)}"
+                )
+            acc_has_env = "dsn_env" in acc_spec
+            acc_has_file = "dsn_file" in acc_spec
+            if acc_has_env and acc_has_file:
+                raise ServerConfigError(
+                    f"{acc_ctx} cannot specify both 'dsn_env' and 'dsn_file'"
+                )
+            if not acc_has_env and not acc_has_file:
+                raise ServerConfigError(
+                    f"{acc_ctx} must specify either 'dsn_env' or 'dsn_file'"
+                )
+            if acc_has_env:
+                acc_env_val = _validate_dsn_env_name(acc_spec["dsn_env"], acc_ctx)
+                accounts_clean[acc_name] = PostgresAccountConfig(dsn_env=acc_env_val)
+            else:
+                acc_file_val = _validate_dsn_file_path(
+                    acc_spec["dsn_file"], f"{acc_ctx} dsn_file"
+                )
+                accounts_clean[acc_name] = PostgresAccountConfig(
+                    dsn_file=acc_file_val
+                )
+
+    # Pool bounds and timeouts
+    pool_max = eng_spec.get("pool_max", 8)
+    if (
+        isinstance(pool_max, bool)
+        or not isinstance(pool_max, int)
+        or pool_max < 1
+        or pool_max > 64
+    ):
+        raise ServerConfigError(
+            f"{ctx} 'pool_max' must be an integer between 1 and 64"
+        )
+
+    pool_min = eng_spec.get("pool_min", 0)
+    if (
+        isinstance(pool_min, bool)
+        or not isinstance(pool_min, int)
+        or pool_min < 0
+        or pool_min > pool_max
+    ):
+        raise ServerConfigError(
+            f"{ctx} 'pool_min' must be an integer between 0 and pool_max ({pool_max})"
+        )
+
+    def _pos_timeout(field_k: str, default_v: float) -> float:
+        raw_v = eng_spec.get(field_k, default_v)
+        if isinstance(raw_v, (bool, str)) or not isinstance(raw_v, (int, float)):
+            raise ServerConfigError(
+                f"{ctx} '{field_k}' must be a positive number"
+            )
+        fv = float(raw_v)
+        if fv <= 0 or math.isnan(fv) or math.isinf(fv):
+            raise ServerConfigError(
+                f"{ctx} '{field_k}' must be a positive number"
+            )
+        return fv
+
+    ct_f = _pos_timeout("connect_timeout_seconds", 10.0)
+    mi_f = _pos_timeout("max_idle_seconds", 300.0)
+    ml_f = _pos_timeout("max_lifetime_seconds", 1800.0)
+    at_f = _pos_timeout("acquire_timeout_seconds", 5.0)
+
+    # role_guard
+    raw_role_guard = eng_spec.get("role_guard", True)
+    if isinstance(raw_role_guard, bool):
+        role_guard = raw_role_guard
+        role_guard_deny_roles = DEFAULT_DENY_ROLES
+    elif isinstance(raw_role_guard, Mapping):
+        unknown_rg = set(raw_role_guard.keys()) - {"enabled", "deny_roles"}
+        if unknown_rg:
+            safe_rg_keys = ", ".join(
+                _safe_label(str(k)) for k in sorted(unknown_rg, key=str)
+            )
+            raise ServerConfigError(
+                f"Unknown key(s) in {ctx} 'role_guard': {safe_rg_keys}"
+            )
+        enabled_raw = raw_role_guard.get("enabled", True)
+        if not isinstance(enabled_raw, bool):
+            raise ServerConfigError(
+                f"{ctx} 'role_guard.enabled' must be a boolean"
+            )
+        role_guard = enabled_raw
+        if "deny_roles" in raw_role_guard and raw_role_guard["deny_roles"] is not None:
+            dr_val = raw_role_guard["deny_roles"]
+            if isinstance(dr_val, Sequence) and not isinstance(
+                dr_val, (str, bytes, bytearray, Mapping)
+            ):
+                for item in dr_val:
+                    if isinstance(item, str) and _SUSPICIOUS_TOKEN_RE.search(item):
+                        raise ServerConfigError(
+                            f"{ctx} 'role_guard.deny_roles' entries must match "
+                            "^[A-Za-z_][A-Za-z0-9_-]{0,62}$"
+                        )
+            role_guard_deny_roles = validate_deny_roles(
+                dr_val,
+                error_cls=ServerConfigError,
+            )
+        else:
+            role_guard_deny_roles = DEFAULT_DENY_ROLES
+    else:
+        raise ServerConfigError(
+            f"{ctx} 'role_guard' must be a boolean or a mapping"
+        )
+    if kind == "lakebase" and role_guard is False:
+        raise ServerConfigError(
+            f"Lakebase connection '{safe_eng}' cannot disable 'role_guard'"
+        )
+
+    # session
+    session_cfg: PostgresSessionConfig | None = None
+    if "session" in eng_spec and eng_spec["session"] is not None:
+        session_cfg = _parse_postgres_session_block(eng_spec["session"], ctx)
+
+    # tls
+    tls_cfg: PostgresTLSConfig | None = None
+    if "tls" in eng_spec and eng_spec["tls"] is not None:
+        tls_cfg = _parse_postgres_tls_block(eng_spec["tls"], ctx)
+
+    if kind == "lakebase" and lakebase_cfg is not None:
+        if tls_cfg is not None and tls_cfg.allow_insecure_tls:
+            raise ServerConfigError(
+                f"Lakebase connection '{safe_eng}' forbids 'tls.allow_insecure_tls'; "
+                f"sslmode='verify-full' is mandatory"
+            )
+        if (
+            tls_cfg is None
+            or tls_cfg.sslmode != "verify-full"
+            or not tls_cfg.sslrootcert_file
+        ):
+            raise ServerConfigError(
+                f"Lakebase connection '{safe_eng}' requires 'tls' with "
+                f"sslmode='verify-full' and a non-empty 'sslrootcert_file'"
+            )
+    elif tls_cfg is not None and tls_cfg.sslmode != "verify-full":
+        if not tls_cfg.allow_insecure_tls:
+            raise ServerConfigError(
+                f"{ctx} 'tls.sslmode' ('{tls_cfg.sslmode}') is weaker than "
+                f"'verify-full'; use 'verify-full' or explicitly set "
+                f"'tls.allow_insecure_tls: true'"
+            )
+
+    # mode
+    if kind == "postgres":
+        mode_raw = eng_spec.get("mode", "read_only")
+        if not isinstance(mode_raw, str) or mode_raw.strip() not in VALID_POSTGRES_MODES:
+            raise ServerConfigError(
+                f"{ctx} 'mode' must be 'read_only' or 'read_write', "
+                f"got '{_safe_enum_token(mode_raw)}'"
+            )
+        mode_clean = mode_raw.strip()
+    else:
+        if lakebase_cfg is not None:
+            ep_mode = getattr(lakebase_cfg, "endpoint_type", "read_write")
+            if "mode" in eng_spec and eng_spec["mode"] is not None:
+                m_raw = eng_spec["mode"]
+                if (
+                    not isinstance(m_raw, str)
+                    or m_raw.strip() not in VALID_POSTGRES_MODES
+                ):
+                    raise ServerConfigError(
+                        f"{ctx} 'mode' must be 'read_only' or 'read_write'"
+                    )
+                if m_raw.strip() != ep_mode:
+                    raise ServerConfigError(
+                        f"{ctx} 'mode' ('{m_raw.strip()}') conflicts with "
+                        f"'lakebase.endpoint_type' ('{ep_mode}')"
+                    )
+            mode_clean = ep_mode
+        else:
+            mode_raw = eng_spec.get("mode", "read_write")
+            if (
+                not isinstance(mode_raw, str)
+                or mode_raw.strip() not in VALID_POSTGRES_MODES
+            ):
+                raise ServerConfigError(
+                    f"{ctx} 'mode' must be 'read_only' or 'read_write', "
+                    f"got '{_safe_enum_token(mode_raw)}'"
+                )
+            mode_clean = mode_raw.strip()
+
+    # storage_class
+    storage_class_clean: str | None = None
+    if lakebase_cfg is None and "storage_class" in eng_spec:
+        storage_class_clean = _validate_optional_storage_class(
+            eng_spec.get("storage_class"), ctx
+        )
+
+    # freshness
+    freshness_cfg: Any = None
+    if "freshness" in eng_spec and eng_spec["freshness"] is not None:
+        default_st = (
+            "public._lakebase_sync_state" if kind == "lakebase" else None
+        )
+        freshness_cfg = _parse_postgres_freshness_block(
+            eng_spec["freshness"], ctx, default_sync_table=default_st
+        )
+    elif lakebase_cfg is not None:
+        freshness_cfg = getattr(lakebase_cfg, "freshness", None)
+
+    # Emit warnings after validation succeeds
+    if tls_cfg is not None and tls_cfg.sslmode != "verify-full" and tls_cfg.allow_insecure_tls:
+        logger.warning(
+            "connection '%s' uses insecure TLS sslmode='%s' via tls.allow_insecure_tls: true",
+            safe_eng,
+            tls_cfg.sslmode,
+        )
+    if kind == "postgres" and role_guard is False:
+        logger.warning(
+            "connection '%s' has role_guard: false; superuser and BYPASSRLS checks are disabled",
+            safe_eng,
+        )
+    if kind == "lakebase" and lakebase_cfg is None:
+        logger.warning(
+            "connection '%s' uses kind: lakebase without a lakebase: endpoint block; "
+            "if this is a plain PostgreSQL database relabel it kind: postgres "
+            "(mode: read_write keeps today's write behaviour), otherwise add the lakebase: block",
+            safe_eng,
+        )
+    elif kind == "lakebase" and mode_clean == "read_only":
+        logger.warning(
+            "connection '%s': read_only Lakebase endpoints serve a frozen snapshot",
+            safe_eng,
+        )
+
+    if kind == "postgres":
+        return PostgresConnectionConfig(
+            kind="postgres",
+            mode=mode_clean,
+            dsn_env=dsn_env_clean,
+            dsn_file=dsn_file_clean,
+            accounts=accounts_clean,
+            pool_max=pool_max,
+            pool_min=pool_min,
+            connect_timeout_seconds=ct_f,
+            max_idle_seconds=mi_f,
+            max_lifetime_seconds=ml_f,
+            acquire_timeout_seconds=at_f,
+            session=session_cfg,
+            tls=tls_cfg,
+            role_guard=role_guard,
+            role_guard_deny_roles=role_guard_deny_roles,
+            storage_class=storage_class_clean,
+            freshness=freshness_cfg,
+        )
+
+    return LakebaseConnectionConfig(
+        kind="lakebase",
+        dsn_env=dsn_env_clean,
+        pool_max=pool_max,
+        pool_min=pool_min,
+        connect_timeout_seconds=ct_f,
+        max_idle_seconds=mi_f,
+        max_lifetime_seconds=ml_f,
+        acquire_timeout_seconds=at_f,
+        dsn_file=dsn_file_clean,
+        accounts=accounts_clean,
+        mode=mode_clean,
+        session=session_cfg,
+        tls=tls_cfg,
+        role_guard=role_guard,
+        role_guard_deny_roles=role_guard_deny_roles,
+        storage_class=storage_class_clean,
+        lakebase=lakebase_cfg,
+        freshness=freshness_cfg,
+    )
+
+
 @dataclass(frozen=True)
 class ListenConfig:
     host: str = "0.0.0.0"
@@ -458,6 +1164,32 @@ class StarRocksAccountConfig:
 class StarRocksConnectionConfig:
     kind: str = "starrocks"
     accounts: dict[str, StarRocksAccountConfig] = field(default_factory=dict)
+    storage_class: str | None = None
+
+
+@dataclass(frozen=True)
+class PostgresConnectionConfig:
+    kind: str = "postgres"
+    mode: str = "read_only"
+    dsn_env: str = ""
+    dsn_file: str | None = None
+    accounts: dict[str, PostgresAccountConfig] = field(default_factory=dict)
+    pool_max: int = 8
+    pool_min: int = 0
+    connect_timeout_seconds: float = 10.0
+    max_idle_seconds: float = 300.0
+    max_lifetime_seconds: float = 1800.0
+    acquire_timeout_seconds: float = 5.0
+    session: PostgresSessionConfig | None = None
+    tls: PostgresTLSConfig | None = None
+    role_guard: bool = True
+    role_guard_deny_roles: tuple[str, ...] = DEFAULT_DENY_ROLES
+    storage_class: str | None = None
+    freshness: PostgresFreshnessConfig | None = None
+
+    @property
+    def read_only(self) -> bool:
+        return self.mode == "read_only"
 
 
 @dataclass(frozen=True)
@@ -470,6 +1202,24 @@ class LakebaseConnectionConfig:
     max_idle_seconds: float = 300.0
     max_lifetime_seconds: float = 1800.0
     acquire_timeout_seconds: float = 5.0
+    dsn_file: str | None = None
+    accounts: dict[str, PostgresAccountConfig] = field(default_factory=dict)
+    mode: str = "read_write"
+    session: PostgresSessionConfig | None = None
+    tls: PostgresTLSConfig | None = None
+    role_guard: bool = True
+    role_guard_deny_roles: tuple[str, ...] = DEFAULT_DENY_ROLES
+    storage_class: str | None = None
+    lakebase: Any = None
+    freshness: Any = None
+
+    @property
+    def is_legacy(self) -> bool:
+        return self.lakebase is None
+
+    @property
+    def read_only(self) -> bool:
+        return self.mode == "read_only"
 
 
 @dataclass(frozen=True)
@@ -481,6 +1231,7 @@ class CubeConnectionConfig:
     sql_user: str = ""
     secret_env: str | None = None
     connect_timeout_seconds: float = 10.0
+    storage_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -529,6 +1280,7 @@ class DuckDBConnectionConfig:
     recycle_seconds: float | None = None
     token_lifetime_seconds: float | None = None
     external_access_after_attach: str = "off"
+    storage_class: str | None = None
     secrets_env: Mapping[str, str] = field(default_factory=dict, repr=False)
 
 
@@ -560,6 +1312,7 @@ class ServerConfig:
     compilation_cache_max_entries: int = DEFAULT_COMPILATION_CACHE_MAX_ENTRIES
     audit: AuditConfig | None = None
     ops: OpsConfig | None = None
+    cursor_key_env: str | None = None
 
     def __post_init__(self) -> None:
         validate_compilation_cache_max_entries(
@@ -570,6 +1323,13 @@ class ServerConfig:
             raise ServerConfigError("'audit' must be an AuditConfig instance or None")
         if self.ops is not None and not isinstance(self.ops, OpsConfig):
             raise ServerConfigError("'ops' must be an OpsConfig instance or None")
+        if self.cursor_key_env is not None and (
+            not isinstance(self.cursor_key_env, str)
+            or not _ENV_VAR_NAME_RE.fullmatch(self.cursor_key_env)
+        ):
+            raise ServerConfigError(
+                "'cursor_key_env' must be None or a valid environment variable name"
+            )
         if self.secrets_env:
             register_config_secrets(*self.secrets_env.values())
         for conn in self.connections.values():
@@ -595,6 +1355,12 @@ class ServerConfig:
                 for acc in conn.accounts.values():
                     if acc.password_file:
                         candidate_files.append(acc.password_file)
+            elif isinstance(conn, (PostgresConnectionConfig, LakebaseConnectionConfig)):
+                if conn.dsn_file:
+                    candidate_files.append(conn.dsn_file)
+                for acc in conn.accounts.values():
+                    if acc.dsn_file:
+                        candidate_files.append(acc.dsn_file)
         if self.placement.discovery_config is not None:
             disc = self.placement.discovery_config
             if (
@@ -645,9 +1411,25 @@ class ServerConfig:
                         referenced.append(acc.url_env)
                     if acc.password_env:
                         referenced.append(acc.password_env)
+            elif isinstance(conn, PostgresConnectionConfig):
+                if conn.dsn_env:
+                    referenced.append(conn.dsn_env)
+                for acc in conn.accounts.values():
+                    if acc.dsn_env:
+                        referenced.append(acc.dsn_env)
             elif isinstance(conn, LakebaseConnectionConfig):
                 if conn.dsn_env:
                     referenced.append(conn.dsn_env)
+                for acc in conn.accounts.values():
+                    if acc.dsn_env:
+                        referenced.append(acc.dsn_env)
+                if conn.lakebase is not None:
+                    cs = getattr(conn.lakebase, "cold_start", None)
+                    api_tok_env = (
+                        getattr(cs, "api_token_env", None) if cs is not None else None
+                    )
+                    if api_tok_env:
+                        referenced.append(api_tok_env)
             elif isinstance(conn, CubeConnectionConfig):
                 if conn.secret_env:
                     referenced.append(conn.secret_env)
@@ -681,6 +1463,10 @@ class ServerConfig:
         if self.ops is not None and self.ops.auth_token_env:
             referenced.append(self.ops.auth_token_env)
 
+        # Cursor signing key env
+        if self.cursor_key_env:
+            referenced.append(self.cursor_key_env)
+
         return referenced
 
     def check_secret_files(self) -> None:
@@ -689,13 +1475,46 @@ class ServerConfig:
 
         # Connections
         for eng_name, conn in self.connections.items():
+            safe_eng = _safe_label(eng_name)
             if isinstance(conn, StarRocksConnectionConfig):
                 for acc_name, acc in conn.accounts.items():
                     if acc.password_file:
                         secret_files.append(
                             (
                                 acc.password_file,
-                                f"StarRocks account '{acc_name}' password_file",
+                                f"StarRocks account '{_safe_label(acc_name)}' password_file",
+                            )
+                        )
+            elif isinstance(conn, PostgresConnectionConfig):
+                if conn.dsn_file:
+                    secret_files.append(
+                        (
+                            conn.dsn_file,
+                            f"Postgres connection '{safe_eng}' dsn_file",
+                        )
+                    )
+                for acc_name, acc in conn.accounts.items():
+                    if acc.dsn_file:
+                        secret_files.append(
+                            (
+                                acc.dsn_file,
+                                f"Postgres connection '{safe_eng}' account '{_safe_label(acc_name)}' dsn_file",
+                            )
+                        )
+            elif isinstance(conn, LakebaseConnectionConfig):
+                if conn.dsn_file:
+                    secret_files.append(
+                        (
+                            conn.dsn_file,
+                            f"Lakebase connection '{safe_eng}' dsn_file",
+                        )
+                    )
+                for acc_name, acc in conn.accounts.items():
+                    if acc.dsn_file:
+                        secret_files.append(
+                            (
+                                acc.dsn_file,
+                                f"Lakebase connection '{safe_eng}' account '{_safe_label(acc_name)}' dsn_file",
                             )
                         )
 
@@ -732,29 +1551,53 @@ class ServerConfig:
                 )
             read_secret_file(path)
 
-    def check_env(self, env: Mapping[str, str] | None = None) -> None:
+    def check_env(
+        self,
+        env: Mapping[str, str] | None = None,
+        *,
+        cursor_key: bytes | str | None = None,
+    ) -> None:
         """Verify that every referenced environment variable exists and secret files are safe."""
         for var in self.get_referenced_env_vars():
-            self.get_env(var, env)
+            if self.cursor_key_env is not None and var == self.cursor_key_env:
+                from seeknal.serving.startup_validation import (
+                    resolve_startup_cursor_key,
+                )
+
+                resolve_startup_cursor_key(
+                    self,
+                    cursor_key=cursor_key,
+                    env=env,
+                )
+            else:
+                self.get_env(var, env)
         self.check_secret_files()
 
     def validate_runtime_wiring(
         self,
         *,
         env: Mapping[str, str] | None = None,
+        check_cursor_key: bool = False,
+        cursor_key: bytes | str | None = None,
     ) -> PreflightResult:
         """Offline preflight validation of env, static placement/schemas, and engine-connection wiring.
 
         Returns a PreflightResult so callers (such as build_server) can reuse parsed
         static Placement and schemas without re-reading files.
         """
-        self.check_env(env=env)
+        self.check_env(env=env, cursor_key=cursor_key)
         if self.audit is not None:
             verify_audit_config_offline(self.audit, error_cls=AuditStartupError)
 
         from seeknal.serving.startup_validation import validate_startup
 
-        report = validate_startup(self, env=env, check_grant_keys=False)
+        report = validate_startup(
+            self,
+            env=env,
+            check_grant_keys=False,
+            check_cursor_key=check_cursor_key,
+            cursor_key=cursor_key,
+        )
         return PreflightResult(
             mode=report.mode,
             placement=report.placement,
@@ -793,11 +1636,12 @@ class ServerConfig:
             "compilation_cache_max_entries",
             "audit",
             "ops",
+            "cursor_key_env",
         }
         unknown_top = set(d.keys()) - allowed_top
         if unknown_top:
             raise ServerConfigError(
-                f"Unknown top-level configuration key(s): {sorted(unknown_top)}"
+                f"Unknown top-level configuration key(s): {sorted(_safe_label(str(k)) for k in unknown_top)}"
             )
 
         # 2. listen
@@ -1062,20 +1906,25 @@ class ServerConfig:
             kind = eng_spec.get("kind")
             if not kind or not isinstance(kind, str) or not kind.strip():
                 raise ServerConfigError(
-                    f"Connection '{eng_name_str}' missing required field 'kind'"
+                    f"Connection '{_safe_label(eng_name_str)}' missing required field 'kind'"
                 )
             kind = kind.strip()
-            if kind not in ("starrocks", "lakebase", "cube", "duckdb"):
+            if kind not in ("starrocks", "postgres", "lakebase", "cube", "duckdb"):
                 raise ServerConfigError(
                     f"Unsupported connection kind '{_safe_enum_token(kind)}' for engine '{_safe_label(eng_name_str)}'"
                 )
 
             if kind == "starrocks":
-                unknown_sr = set(eng_spec.keys()) - {"kind", "accounts"}
+                unknown_sr = set(eng_spec.keys()) - {"kind", "accounts", "storage_class"}
                 if unknown_sr:
                     raise ServerConfigError(
-                        f"Unknown key(s) in starrocks connection '{eng_name_str}': {sorted(unknown_sr)}"
+                        f"Unknown key(s) in starrocks connection '{_safe_label(eng_name_str)}': "
+                        f"{sorted(_safe_label(str(k)) for k in unknown_sr)}"
                     )
+                sr_storage_class = _validate_optional_storage_class(
+                    eng_spec.get("storage_class"),
+                    f"StarRocks connection '{_safe_label(eng_name_str)}'",
+                )
                 accounts_raw = eng_spec.get("accounts")
                 if not isinstance(accounts_raw, Mapping) or not accounts_raw:
                     raise ServerConfigError(
@@ -1196,115 +2045,14 @@ class ServerConfig:
                             password_file=pfile_val,
                             database=database.strip() if database else None,
                         )
-                connections[eng_name_str] = StarRocksConnectionConfig(accounts=accounts)
+                connections[eng_name_str] = StarRocksConnectionConfig(
+                    accounts=accounts,
+                    storage_class=sr_storage_class,
+                )
 
-            elif kind == "lakebase":
-                unknown_lb = set(eng_spec.keys()) - {
-                    "kind",
-                    "dsn_env",
-                    "pool_max",
-                    "pool_min",
-                    "connect_timeout_seconds",
-                    "max_idle_seconds",
-                    "max_lifetime_seconds",
-                    "acquire_timeout_seconds",
-                }
-                if unknown_lb:
-                    raise ServerConfigError(
-                        f"Unknown key(s) in lakebase connection '{eng_name_str}': {sorted(unknown_lb)}"
-                    )
-                dsn_env = eng_spec.get("dsn_env")
-                if not dsn_env or not isinstance(dsn_env, str) or not dsn_env.strip():
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' missing required 'dsn_env'"
-                    )
-
-                pool_max = eng_spec.get("pool_max", 8)
-                if (
-                    isinstance(pool_max, bool)
-                    or not isinstance(pool_max, int)
-                    or pool_max < 1
-                    or pool_max > 64
-                ):
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'pool_max' must be an integer between 1 and 64, got {pool_max}"
-                    )
-
-                pool_min = eng_spec.get("pool_min", 0)
-                if (
-                    isinstance(pool_min, bool)
-                    or not isinstance(pool_min, int)
-                    or pool_min < 0
-                    or pool_min > pool_max
-                ):
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'pool_min' must be an integer between 0 and pool_max ({pool_max}), got {pool_min}"
-                    )
-
-                ct_val = eng_spec.get("connect_timeout_seconds", 10.0)
-                if isinstance(ct_val, (bool, str)) or not isinstance(ct_val, (int, float)):
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'connect_timeout_seconds' must be a positive number"
-                    )
-                try:
-                    ct_f = float(ct_val)
-                    if ct_f <= 0 or math.isnan(ct_f) or math.isinf(ct_f):
-                        raise ValueError()
-                except (TypeError, ValueError) as exc:
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'connect_timeout_seconds' must be a positive number"
-                    ) from exc
-
-                mi_val = eng_spec.get("max_idle_seconds", 300.0)
-                if isinstance(mi_val, (bool, str)) or not isinstance(mi_val, (int, float)):
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'max_idle_seconds' must be a positive number"
-                    )
-                try:
-                    mi_f = float(mi_val)
-                    if mi_f <= 0 or math.isnan(mi_f) or math.isinf(mi_f):
-                        raise ValueError()
-                except (TypeError, ValueError) as exc:
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'max_idle_seconds' must be a positive number"
-                    ) from exc
-
-                ml_val = eng_spec.get("max_lifetime_seconds", 1800.0)
-                if isinstance(ml_val, (bool, str)) or not isinstance(ml_val, (int, float)):
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'max_lifetime_seconds' must be a positive number"
-                    )
-                try:
-                    ml_f = float(ml_val)
-                    if ml_f <= 0 or math.isnan(ml_f) or math.isinf(ml_f):
-                        raise ValueError()
-                except (TypeError, ValueError) as exc:
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'max_lifetime_seconds' must be a positive number"
-                    ) from exc
-
-                at_val = eng_spec.get("acquire_timeout_seconds", 5.0)
-                if isinstance(at_val, (bool, str)) or not isinstance(at_val, (int, float)):
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'acquire_timeout_seconds' must be a positive number"
-                    )
-                try:
-                    at_f = float(at_val)
-                    if at_f <= 0 or math.isnan(at_f) or math.isinf(at_f):
-                        raise ValueError()
-                except (TypeError, ValueError) as exc:
-                    raise ServerConfigError(
-                        f"Lakebase connection '{eng_name_str}' 'acquire_timeout_seconds' must be a positive number"
-                    ) from exc
-
-                connections[eng_name_str] = LakebaseConnectionConfig(
-                    dsn_env=dsn_env.strip(),
-                    pool_max=pool_max,
-                    pool_min=pool_min,
-                    connect_timeout_seconds=ct_f,
-                    max_idle_seconds=mi_f,
-                    max_lifetime_seconds=ml_f,
-                    acquire_timeout_seconds=at_f,
+            elif kind in ("postgres", "lakebase"):
+                connections[eng_name_str] = _parse_postgres_wire_connection(
+                    eng_name_str, eng_spec, kind=kind
                 )
 
             elif kind == "cube":
@@ -1316,11 +2064,17 @@ class ServerConfig:
                     "sql_user",
                     "secret_env",
                     "connect_timeout_seconds",
+                    "storage_class",
                 }
                 if unknown_cube:
                     raise ServerConfigError(
-                        f"Unknown key(s) in cube connection '{eng_name_str}': {sorted(unknown_cube)}"
+                        f"Unknown key(s) in cube connection '{_safe_label(eng_name_str)}': "
+                        f"{sorted(_safe_label(str(k)) for k in unknown_cube)}"
                     )
+                cube_storage_class = _validate_optional_storage_class(
+                    eng_spec.get("storage_class"),
+                    f"Cube connection '{_safe_label(eng_name_str)}'",
+                )
                 host = eng_spec.get("host")
                 if not host or not isinstance(host, str) or not host.strip():
                     raise ServerConfigError(
@@ -1394,6 +2148,7 @@ class ServerConfig:
                     sql_user=sql_user.strip(),
                     secret_env=secret_env_str,
                     connect_timeout_seconds=timeout_float,
+                    storage_class=cube_storage_class,
                 )
 
             elif kind == "duckdb":
@@ -1467,11 +2222,17 @@ class ServerConfig:
                         "temp_directory",
                         "max_temp_directory_size",
                         "max_concurrent_cursors",
+                        "storage_class",
                     }
                     if unknown_duck:
                         raise ServerConfigError(
-                            f"Unknown key(s) in duckdb connection '{eng_name_str}': {sorted(unknown_duck)}"
+                            f"Unknown key(s) in duckdb connection '{_safe_label(eng_name_str)}': "
+                            f"{sorted(_safe_label(str(k)) for k in unknown_duck)}"
                         )
+                    duck_storage_class = _validate_optional_storage_class(
+                        eng_spec.get("storage_class"),
+                        f"DuckDB connection '{_safe_label(eng_name_str)}'",
+                    )
                     path = eng_spec.get("path")
                     if not path or not isinstance(path, str) or not path.strip():
                         raise ServerConfigError(
@@ -1536,6 +2297,7 @@ class ServerConfig:
                         temp_directory=temp_dir,
                         max_temp_directory_size=max_temp_sz,
                         max_concurrent_cursors=max_concurrent_cursors,
+                        storage_class=duck_storage_class,
                     )
                 else:
                     if "path" in eng_spec:
@@ -1558,12 +2320,18 @@ class ServerConfig:
                         "memory_limit",
                         "threads",
                         "max_concurrent_cursors",
+                        "storage_class",
                     }
                     if unknown_iceberg_duck:
                         raise ServerConfigError(
                             f"Unknown key(s) in duckdb iceberg_direct connection '{eng_name_str}': "
                             f"{sorted(_safe_label(str(k)) for k in unknown_iceberg_duck)}"
                         )
+                    iceberg_duck_storage_class = _validate_optional_storage_class(
+                        eng_spec.get("storage_class"),
+                        f"DuckDB iceberg_direct connection '{_safe_label(eng_name_str)}'",
+                        forbid_local=True,
+                    )
 
                     ext_dir = eng_spec.get("extension_directory")
                     if not ext_dir or not isinstance(ext_dir, str) or not ext_dir.strip():
@@ -1949,6 +2717,7 @@ class ServerConfig:
                         temp_directory=temp_dir,
                         max_temp_directory_size=max_temp_sz,
                         max_concurrent_cursors=max_concurrent_cursors,
+                        storage_class=iceberg_duck_storage_class,
                         secrets_env=scoped_secrets_env,
                     )
 
@@ -2059,6 +2828,21 @@ class ServerConfig:
         else:
             ops_cfg = OpsConfig.from_dict(ops_raw, error_cls=ServerConfigError)
 
+        # 18. cursor_key_env
+        cursor_key_env_raw = d.get("cursor_key_env")
+        cursor_key_env: str | None = None
+        if cursor_key_env_raw is not None:
+            if (
+                not isinstance(cursor_key_env_raw, str)
+                or not cursor_key_env_raw.strip()
+                or not _ENV_VAR_NAME_RE.fullmatch(cursor_key_env_raw.strip())
+            ):
+                raise ServerConfigError(
+                    "'cursor_key_env' must be a valid environment variable name "
+                    "matching ^[A-Za-z_][A-Za-z0-9_]{0,127}$"
+                )
+            cursor_key_env = cursor_key_env_raw.strip()
+
         server_config = cls(
             listen=listen_cfg,
             tls=tls_cfg,
@@ -2077,6 +2861,7 @@ class ServerConfig:
             compilation_cache_max_entries=compilation_cache_max_entries,
             audit=audit_cfg,
             ops=ops_cfg,
+            cursor_key_env=cursor_key_env,
         )
 
         server_config._register_resolved_secrets(env=env)

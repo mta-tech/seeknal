@@ -33,6 +33,9 @@ def _load_script_module(module_name: str, rel_path: str):
     return module
 
 
+if not (REPO_ROOT / "docker/serving-image/prefetch.py").exists():
+    pytest.skip("docker/ not present in this checkout", allow_module_level=True)
+
 prefetch_mod = _load_script_module(
     "serving_image_prefetch", "docker/serving-image/prefetch.py"
 )

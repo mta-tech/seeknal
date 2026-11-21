@@ -512,3 +512,326 @@ def test_result_drives_real_serving_pipeline(ec_key):
         max_staleness_seconds=30.0,
     )
     assert prep_stale.engine == "sr"
+
+
+def test_cli_emit_with_standalone_and_full_serving_yaml(tmp_path, capsys):
+    import json
+    import yaml
+
+    from seeknal.serving.discovery.__main__ import main as discovery_main
+    from seeknal.serving.placement import VALID_ENGINE_KINDS
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog
+
+    lb_cat = FakePostgresCatalog()
+    lb_cat.add_table(
+        "ops",
+        "ticket_open",
+        reltuples=500,
+        columns=[("ticket_id", "text", True), ("status", "text", True)],
+        indexes=[
+            {
+                "index_name": "ticket_open_pkey",
+                "amname": "btree",
+                "columns": ["ticket_id"],
+                "is_primary": True,
+            }
+        ],
+    )
+
+    # 1. Full serving.yaml with top-level placement.discovery -> --emit writes loadable static placement YAML
+    serving_cfg = {
+        "default_catalog": "ops",
+        "connections": {
+            "lb_ops": {
+                "kind": "lakebase",
+                "dsn_env": "LB_OPS_DSN",
+                "tls": {
+                    "sslmode": "verify-full",
+                    "sslrootcert_file": "/etc/seeknal/tls/lb-ca.pem",
+                },
+                "lakebase": {
+                    "project_id": "prj_aaaaaaaaaaaaaaaaaaaa",
+                    "branch_id": "br_aaaaaaaaaaaaaaaaaaaa",
+                    "endpoint_id": "ep_aaaaaaaaaaaaaaaaaaaa",
+                    "endpoint_type": "read_write",
+                },
+            }
+        },
+        "placement": {
+            "discovery": {
+                "refresh_interval_seconds": 120,
+                "engines": {
+                    "lb_ops": {"kind": "lakebase", "dialect": "postgres"},
+                },
+                "postgres_sources": {
+                    "lb_ops": {
+                        "logical_catalog": "ops",
+                        "schemas": {"ops": {"include": ["ticket_*"]}},
+                    }
+                },
+            }
+        },
+    }
+    serving_yaml = tmp_path / "serving.yaml"
+    serving_yaml.write_text(yaml.safe_dump(serving_cfg), encoding="utf-8")
+    emitted_yaml = tmp_path / "emitted_placement.yaml"
+
+    rc = discovery_main(
+        ["--config", str(serving_yaml), "--emit", str(emitted_yaml)],
+        postgres_connects={"lb_ops": lb_cat.connect},
+    )
+    assert rc == 0
+    assert emitted_yaml.exists()
+
+    loaded = Placement.from_yaml(emitted_yaml)
+    assert "ops.ops.ticket_open" in loaded.tables
+    assert loaded.tables["ops.ops.ticket_open"].keys == ("ticket_id",)
+    assert loaded.tables["ops.ops.ticket_open"].serves[0].physical_name == "ops.ticket_open"
+
+    raw_emitted = yaml.safe_load(emitted_yaml.read_text(encoding="utf-8"))
+    assert raw_emitted["tables"]["ops.ops.ticket_open"]["access"]["pattern"] == "scan"
+
+    # 2. --emit with --schemas-out writes both files; standalone discovery YAML with kind: postgres
+    pg_cat = FakePostgresCatalog()
+    pg_cat.add_table(
+        "src_pii",
+        "customer",
+        reltuples=1000,
+        columns=[("customer_id", "text", True), ("full_name", "text", True)],
+        indexes=[
+            {
+                "index_name": "customer_pkey",
+                "amname": "btree",
+                "columns": ["customer_id"],
+                "is_primary": True,
+            }
+        ],
+    )
+    standalone_yaml = tmp_path / "disc.yaml"
+    standalone_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "default_catalog": "cbn",
+                "engines": {"pg_report": {"kind": "postgres", "dialect": "postgres"}},
+                "postgres_sources": {
+                    "pg_report": {
+                        "logical_catalog": "cbn",
+                        "schemas": {"src_pii": {"include": ["customer"]}},
+                    }
+                },
+                "pii_tables": ["cbn.src_pii.customer"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pg_emit = tmp_path / "pg_placement.yaml"
+    pg_schemas = tmp_path / "pg_schemas.json"
+    # Without storage_classes or connections, standalone PII discovery fails closed as 'unknown'
+    capsys.readouterr()
+    rc_missing_sc = discovery_main(
+        [
+            "--config",
+            str(standalone_yaml),
+            "--emit",
+            str(pg_emit),
+            "--schemas-out",
+            str(pg_schemas),
+        ],
+        lakebase_connect=pg_cat.connect,
+    )
+    assert rc_missing_sc == 2
+    assert "has storage_class unknown" in capsys.readouterr().err
+
+    # Also test lakebase_connect fallback for single postgres_sources engine when storage_class is known
+    rc2 = discovery_main(
+        [
+            "--config",
+            str(standalone_yaml),
+            "--emit",
+            str(pg_emit),
+            "--schemas-out",
+            str(pg_schemas),
+        ],
+        lakebase_connect=pg_cat.connect,
+        storage_classes={"pg_report": "local"},
+    )
+    assert rc2 == 0
+    raw_pg = yaml.safe_load(pg_emit.read_text(encoding="utf-8"))
+    assert raw_pg["engines"]["pg_report"]["kind"] == "postgres"
+    assert raw_pg["tables"]["cbn.src_pii.customer"]["pii"] is True
+    assert json.loads(pg_schemas.read_text(encoding="utf-8")) == {
+        "cbn.src_pii.customer": ["customer_id", "full_name"]
+    }
+    if "postgres" in VALID_ENGINE_KINDS:
+        Placement.from_yaml(pg_emit)
+
+    # 3. Passing both --emit and --placement-out fails cleanly with exit 2
+    capsys.readouterr()
+    rc_conflict = discovery_main(
+        [
+            "--config",
+            str(serving_yaml),
+            "--emit",
+            str(tmp_path / "a.yaml"),
+            "--placement-out",
+            str(tmp_path / "b.yaml"),
+        ]
+    )
+    assert rc_conflict == 2
+    assert "Cannot specify both --emit and --placement-out" in capsys.readouterr().err
+
+
+def test_b_m4_discovery_cli_reuses_validated_server_config_and_enforces_tls_role_guard_and_show(
+    tmp_path, monkeypatch, capsys
+):
+    import yaml
+    from seeknal.serving.discovery.__main__ import main as discovery_main
+    from tests.serving.fake_postgres_catalog import FakePostgresCatalog
+
+    # 1. Weak sslmode without allow_insecure_tls, missing Lakebase TLS, and injected search_path refused
+    for bad_name, bad_conn in (
+        (
+            "weak_pg_tls",
+            {
+                "kind": "postgres",
+                "dsn_env": "PG_DSN",
+                "tls": {"sslmode": "require"},
+            },
+        ),
+        (
+            "bad_search_path",
+            {
+                "kind": "postgres",
+                "dsn_env": "PG_DSN",
+                "session": {"search_path": "pg_catalog; DROP TABLE users"},
+            },
+        ),
+        (
+            "lb_missing_tls",
+            {
+                "kind": "lakebase",
+                "dsn_env": "PG_DSN",
+                "lakebase": {
+                    "project_id": "prj_aaaaaaaaaaaaaaaaaaaa",
+                    "branch_id": "br_aaaaaaaaaaaaaaaaaaaa",
+                    "endpoint_id": "ep_aaaaaaaaaaaaaaaaaaaa",
+                },
+            },
+        ),
+    ):
+        bad_yaml = tmp_path / f"{bad_name}.yaml"
+        bad_yaml.write_text(
+            yaml.safe_dump(
+                {
+                    "default_catalog": "cbn",
+                    "connections": {"src": bad_conn},
+                    "placement": {
+                        "discovery": {
+                            "engines": {
+                                "src": {
+                                    "kind": bad_conn["kind"],
+                                    "dialect": "postgres",
+                                }
+                            },
+                            "postgres_sources": {
+                                "src": {"schemas": {"rpt": {"include": ["*"]}}}
+                            },
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        capsys.readouterr()
+        rc = discovery_main(
+            ["--config", str(bad_yaml), "--emit", str(tmp_path / f"{bad_name}_out.yaml")],
+            env={"PG_DSN": "postgresql://svc:pw@db.internal:5432/cbn"},
+        )
+        assert rc == 2
+        assert "Error:" in capsys.readouterr().err
+
+    # 2. Real CLI path (without injected postgres_connects) uses _make_postgres_wire_connect:
+    # passes sslmode='verify-full' by default on kind: postgres and runs role_guard + SHOW checks!
+    import psycopg2
+
+    pg_cat = FakePostgresCatalog()
+    pg_cat.add_table(
+        "rpt",
+        "sales",
+        reltuples=100,
+        columns=[("id", "int8", True)],
+        indexes=[
+            {
+                "index_name": "sales_pkey",
+                "amname": "btree",
+                "columns": ["id"],
+                "is_primary": True,
+            }
+        ],
+    )
+    recorded_connects: list[tuple[str, dict]] = []
+
+    def fake_psycopg2_connect(dsn: str, **kwargs):
+        recorded_connects.append((dsn, dict(kwargs)))
+        return pg_cat.connect(**kwargs)
+
+    monkeypatch.setattr(psycopg2, "connect", fake_psycopg2_connect)
+
+    valid_srv_yaml = tmp_path / "valid_cli_srv.yaml"
+    valid_srv_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "default_catalog": "cbn",
+                "connections": {
+                    "pg_report": {
+                        "kind": "postgres",
+                        "dsn_env": "PG_CLI_DSN",
+                        "session": {
+                            "statement_timeout_ms": 30000,
+                            "lock_timeout_ms": 2000,
+                            "idle_in_transaction_session_timeout_ms": 10000,
+                            "search_path": "pg_catalog",
+                        },
+                    }
+                },
+                "placement": {
+                    "discovery": {
+                        "engines": {
+                            "pg_report": {"kind": "postgres", "dialect": "postgres"}
+                        },
+                        "postgres_sources": {
+                            "pg_report": {
+                                "logical_catalog": "cbn",
+                                "schemas": {"rpt": {"include": ["sales"]}},
+                            }
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_yaml = tmp_path / "valid_cli_out.yaml"
+    rc_ok = discovery_main(
+        ["--config", str(valid_srv_yaml), "--emit", str(out_yaml)],
+        env={"PG_CLI_DSN": "postgresql://svc:PLANTED_CLI_PW_44@db.internal:5432/cbn"},
+    )
+    assert rc_ok == 0
+    assert len(recorded_connects) == 1
+    _, passed_kw = recorded_connects[0]
+    assert passed_kw["sslmode"] == "verify-full"
+    assert "dsn" not in passed_kw
+    assert any("pg_roles" in sql for sql, _ in pg_cat.executed)
+    assert any("SHOW search_path" in sql for sql, _ in pg_cat.executed)
+
+    # Superuser on CLI discovery connect is refused by role_guard without leaking DSN password!
+    pg_cat.set_role(rolsuper=True)
+    capsys.readouterr()
+    rc_sup = discovery_main(
+        ["--config", str(valid_srv_yaml), "--emit", str(tmp_path / "sup_out.yaml")],
+        env={"PG_CLI_DSN": "postgresql://svc:PLANTED_CLI_PW_44@db.internal:5432/cbn"},
+    )
+    assert rc_sup == 2
+    err_sup = capsys.readouterr().err
+    assert "PLANTED_CLI_PW_44" not in err_sup
+

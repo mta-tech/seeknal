@@ -10,9 +10,12 @@ from seeknal.serving.adapters import (
     DuckDBAdapter,
     EngineError,
     EngineTimeout,
+    PostgresPool,
     QueryResult,
+    WorkloadRoutedAdapter,
     build_adapter,
 )
+from seeknal.serving.postgres_session import PostgresSessionConfig
 from seeknal.serving.service import PreparedQuery
 
 
@@ -483,8 +486,99 @@ def test_build_adapter():
     lb = build_adapter("lakebase", FakeConnection)
     assert isinstance(lb, DBAPIAdapter)
 
+    pg = build_adapter("postgres", FakeConnection, read_only=True, account="bi")
+    assert isinstance(pg, DBAPIAdapter)
+    assert pg.kind == "postgres"
+    assert pg.read_only is True
+    assert pg.account == "bi"
+
     cube = build_adapter("cube", FakeConnection)
     assert isinstance(cube, DBAPIAdapter)
 
     with pytest.raises(ValueError, match="Unsupported engine kind"):
         build_adapter("oracle", FakeConnection)
+
+
+def test_postgres_read_only_preamble_and_write_refusal_before_connect():
+    """Read-only Postgres source opens BEGIN READ ONLY + set_config, and refuses writes before connecting."""
+    connect_calls = 0
+
+    def tracked_connect():
+        nonlocal connect_calls
+        connect_calls += 1
+        return FakeConnection(rows=[(7,)], description=(("id", 23),))
+
+    sess = PostgresSessionConfig(statement_timeout_ms=15000)
+    adapter = DBAPIAdapter(
+        tracked_connect,
+        kind="postgres",
+        read_only=True,
+        session_config=sess,
+        account="bi",
+    )
+
+    # Write statement (row_limit=None) refused BEFORE opening any connection!
+    write_prep = _make_prepared(
+        engine="pg_report",
+        engine_kind="postgres",
+        sql="INSERT INTO rpt VALUES (%s)",
+        params=(1,),
+        paramstyle="format",
+        row_limit=None,
+    )
+    with pytest.raises(EngineError, match="Cannot execute write statement on read-only source"):
+        adapter.execute(write_prep, timeout_seconds=30.0)
+    assert connect_calls == 0
+
+    # Read statement runs BEGIN + SET TRANSACTION READ ONLY, caps timeout at 15000ms (< 30s request), and binds application_name
+    fake_conn = FakeConnection(rows=[(7,)], description=(("id", 23),))
+    adapter_sel = DBAPIAdapter(
+        lambda: fake_conn,
+        kind="postgres",
+        read_only=True,
+        session_config=sess,
+        account="bi",
+    )
+    sel_prep = _make_prepared(
+        engine="pg_report",
+        engine_kind="postgres",
+        sql="SELECT id FROM rpt WHERE id = %s",
+        params=(7,),
+        paramstyle="format",
+        row_limit=10,
+    )
+    res = adapter_sel.execute(sel_prep, timeout_seconds=30.0)
+    assert res.rows == [(7,)]
+    assert fake_conn.recorded_statements == [
+        ("BEGIN", ()),
+        ("SET TRANSACTION READ ONLY", ()),
+        ("SET LOCAL statement_timeout = 15000", ()),
+        (
+            "SELECT set_config('application_name', %s, true)",
+            ("seeknal:interactive:audit-123",),
+        ),
+        ("SELECT id FROM rpt WHERE id = %s", (7,)),
+    ]
+
+
+def test_workload_routed_adapter_close_closes_shared_pool():
+    closed_conns: list[FakeConnection] = []
+
+    def make_conn(**_kw):
+        c = FakeConnection()
+        closed_conns.append(c)
+        return c
+
+    pool = PostgresPool(make_conn, pool_max=4, pool_min=1)
+    assert len(closed_conns) == 1
+    assert not closed_conns[0].closed
+
+    wra = WorkloadRoutedAdapter(
+        {
+            "interactive": DBAPIAdapter(make_conn, kind="postgres", pool=pool),
+            "bi": DBAPIAdapter(make_conn, kind="postgres", pool=pool),
+        }
+    )
+    wra.close()
+    assert closed_conns[0].closed is True
+

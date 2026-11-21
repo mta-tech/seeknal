@@ -1,5 +1,6 @@
 """Tests for RunGrant verification, claim rules, and coverage checking."""
 
+import base64
 import time
 from typing import Any
 import pytest
@@ -252,3 +253,45 @@ def test_coverage_mismatched_digest():
     with pytest.raises(RunGrantError) as exc_info:
         require_plan_covered(grant, plan)
     assert "mismatch" in str(exc_info.value).lower()
+
+
+def test_verify_refuses_non_canonical_signature():
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    for _ in range(20):
+        priv = ec.generate_private_key(ec.SECP256R1())
+        pub = priv.public_key()
+        kid = "catalog-es256-key-1"
+        public_keys = {kid: pub}
+        now = 1700000000
+        claims = make_valid_claims(now=now)
+        token = sign_grant_token(claims, priv, kid=kid)
+
+        header_b64, payload_b64, sig_b64 = token.split(".")
+        rem_sig = len(sig_b64) % 4
+        padded_sig = sig_b64 + ("=" * ((4 - rem_sig) % 4))
+        orig_sig_bytes = base64.urlsafe_b64decode(padded_sig.encode("ascii"))
+
+        non_canonical_sig = None
+        for c in alphabet:
+            if c == sig_b64[-1]:
+                continue
+            cand = sig_b64[:-1] + c
+            cand_padded = cand + ("=" * ((4 - len(cand) % 4) % 4))
+            try:
+                cand_bytes = base64.urlsafe_b64decode(cand_padded.encode("ascii"))
+                if cand_bytes == orig_sig_bytes:
+                    non_canonical_sig = cand
+                    break
+            except Exception:
+                pass
+
+        assert non_canonical_sig is not None, "Failed to find non-canonical signature variant"
+        non_canonical_padded = non_canonical_sig + (
+            "=" * ((4 - len(non_canonical_sig) % 4) % 4)
+        )
+        assert base64.urlsafe_b64decode(non_canonical_padded.encode("ascii")) == orig_sig_bytes
+
+        bad_token = f"{header_b64}.{payload_b64}.{non_canonical_sig}"
+        with pytest.raises(RunGrantError):
+            verify_run_grant(bad_token, public_keys, now=now)
+

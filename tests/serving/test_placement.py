@@ -8,10 +8,16 @@ import pytest
 import yaml
 
 from seeknal.serving.placement import (
+    VALID_ACCESS_PATTERNS,
+    VALID_ENGINE_KINDS,
     Engine,
     Placement,
     PlacementError,
     Policy,
+    TableAccess,
+    TableEntry,
+    TableServe,
+    is_postgres_wire,
 )
 
 FIXTURE_YAML = """
@@ -234,3 +240,218 @@ def test_placement_error_table_cube_collision():
     msg = str(exc_info.value)
     assert "claims.claim" in msg
     assert "collides" in msg
+
+
+def test_postgres_engine_kind_and_is_postgres_wire():
+    assert VALID_ENGINE_KINDS == frozenset(
+        {"starrocks", "cube", "lakebase", "postgres", "duckdb"}
+    )
+    assert is_postgres_wire("postgres") is True
+    assert is_postgres_wire("lakebase") is True
+    assert is_postgres_wire("duckdb") is False
+    assert is_postgres_wire("starrocks") is False
+    assert is_postgres_wire("cube") is False
+    assert is_postgres_wire(None) is False
+
+
+def test_engine_mode_endpoint_type_and_is_writable():
+    # Default writability: lakebase -> True, postgres -> False, others -> False
+    assert Engine("lb", "lakebase", "postgres").is_writable is True
+    assert Engine("lb_rw", "lakebase", "postgres", mode="read_write").is_writable is True
+    assert Engine("lb_ro", "lakebase", "postgres", mode="read_only").is_writable is False
+    assert Engine("pg", "postgres", "postgres").is_writable is False
+    assert Engine("pg_ro", "postgres", "postgres", mode="read_only").is_writable is False
+    assert Engine("pg_rw", "postgres", "postgres", mode="read_write").is_writable is True
+    assert Engine("sr", "starrocks", "starrocks").is_writable is False
+    assert Engine("duck", "duckdb", "duckdb").is_writable is False
+
+    # endpoint_type alias in Placement.from_dict
+    p = Placement.from_dict(
+        {
+            "engines": {
+                "lb_snap": {
+                    "kind": "lakebase",
+                    "dialect": "postgres",
+                    "endpoint_type": "read_only",
+                },
+                "pg_rw": {
+                    "kind": "postgres",
+                    "dialect": "postgres",
+                    "mode": "read_write",
+                },
+            },
+            "tables": {"t": {"keys": ["id"], "serve": {"pg_rw": "public.t"}}},
+        }
+    )
+    assert p.engines["lb_snap"].mode == "read_only"
+    assert p.engines["lb_snap"].is_writable is False
+    assert p.engines["pg_rw"].mode == "read_write"
+    assert p.engines["pg_rw"].is_writable is True
+
+    with pytest.raises(PlacementError, match="invalid mode"):
+        Engine("pg", "postgres", "postgres", mode="rw")
+
+
+def test_placement_rejects_storage_class_in_engines():
+    with pytest.raises(
+        PlacementError,
+        match=(
+            r"Engine 'pg' cannot declare 'storage_class' in placement\.engines; "
+            r"declare 'storage_class' on connections\.pg instead"
+        ),
+    ):
+        Placement.from_dict(
+            {
+                "engines": {
+                    "pg": {
+                        "kind": "postgres",
+                        "dialect": "postgres",
+                        "storage_class": "local",
+                    }
+                },
+                "tables": {"t": {"keys": ["id"], "serve": {"pg": "public.t"}}},
+            }
+        )
+
+
+def test_table_access_validation_and_key_inheritance():
+    assert VALID_ACCESS_PATTERNS == frozenset({"point", "filter", "scan"})
+
+    # Default require_filter from pattern
+    a_point = TableAccess.from_dict({"pattern": "point", "keys": ["id"]})
+    assert a_point.require_filter is True
+    a_filter = TableAccess.from_dict(
+        {"pattern": "filter", "filterable": ["cust_id"]}
+    )
+    assert a_filter.require_filter is True
+    a_scan = TableAccess.from_dict({"pattern": "scan"})
+    assert a_scan.require_filter is False
+
+    # Explicit override of require_filter
+    a_filter_opt = TableAccess.from_dict(
+        {"pattern": "filter", "filterable": ["cust_id"], "require_filter": False}
+    )
+    assert a_filter_opt.require_filter is False
+
+    # Point pattern without keys fails
+    with pytest.raises(PlacementError, match="point.*keys"):
+        TableAccess.from_dict({"pattern": "point"})
+
+    # Bidirectional key inheritance in Placement.from_dict and TableEntry
+    p = Placement.from_dict(
+        {
+            "engines": {"pg": {"kind": "postgres", "dialect": "postgres"}},
+            "tables": {
+                "t_from_access": {
+                    "serve": {"pg": "public.t1"},
+                    "access": {"pattern": "point", "keys": ["k_acc"]},
+                },
+                "t_from_top": {
+                    "keys": ["k_top"],
+                    "serve": {"pg": "public.t2"},
+                    "access": {"pattern": "point"},
+                },
+            },
+        }
+    )
+    t1 = p.find_table("t_from_access")
+    t2 = p.find_table("t_from_top")
+    assert t1 is not None and t1.keys == ("k_acc",) and t1.access.keys == ("k_acc",)
+    assert t2 is not None and t2.keys == ("k_top",) and t2.access.keys == ("k_top",)
+
+    # Direct TableEntry inheritance
+    te = TableEntry(
+        name="direct_t",
+        keys=("id",),
+        row_count=10,
+        serves=(TableServe("pg", "public.dt"),),
+        access=TableAccess(pattern="point"),
+    )
+    assert te.access is not None and te.access.keys == ("id",)
+
+    # Invalid TableAccess fields
+    with pytest.raises(PlacementError, match="pattern"):
+        TableAccess.from_dict({"pattern": "hash"})
+    with pytest.raises(PlacementError, match="filterable"):
+        TableAccess.from_dict({"pattern": "filter", "filterable": [""]})
+    with pytest.raises(PlacementError, match="filterable"):
+        TableAccess.from_dict({"pattern": "filter", "filterable": "col"})
+    with pytest.raises(PlacementError, match="require_filter"):
+        TableAccess.from_dict({"pattern": "scan", "require_filter": "yes"})
+    for bad_max in (0, -5, True, False, "50"):
+        with pytest.raises(PlacementError, match="max_rows"):
+            TableAccess.from_dict({"pattern": "scan", "max_rows": bad_max})
+
+
+def test_tokenized_pii_table_exempt_from_single_serve_and_duckdb_pii_engines():
+    p = Placement.from_dict(
+        {
+            "engines": {
+                "pg": {"kind": "postgres", "dialect": "postgres"},
+                "duck": {"kind": "duckdb", "dialect": "duckdb"},
+            },
+            "tables": {
+                "tok_customer": {
+                    "keys": ["id"],
+                    "pii": True,
+                    "tokenized": True,
+                    "serve": {
+                        "pg": "public.tok_customer",
+                        "duck": "lake.tok_customer",
+                    },
+                }
+            },
+        }
+    )
+    tbl = p.find_table("tok_customer")
+    assert tbl is not None
+    assert tbl.pii is True
+    assert tbl.tokenized is True
+    assert len(tbl.serves) == 2
+
+
+def test_policy_new_fields_and_validation():
+    p = Placement.from_dict(
+        {
+            "engines": {
+                "pg": {"kind": "postgres", "dialect": "postgres"},
+                "lb": {"kind": "lakebase", "dialect": "postgres"},
+            },
+            "tables": {"t": {"keys": ["id"], "serve": {"pg": "public.t"}}},
+            "policy": {
+                "pii_object_storage_engines": ["lb"],
+                "require_filter_min_rows": 50_000,
+                "max_in_list": 500,
+                "max_offset": 2_000,
+                "guard_mode": "warn",
+            },
+        }
+    )
+    assert p.policy.pii_object_storage_engines == ("lb",)
+    assert p.policy.require_filter_min_rows == 50_000
+    assert p.policy.max_in_list == 500
+    assert p.policy.max_offset == 2_000
+    assert p.policy.guard_mode == "warn"
+
+    # Defaults
+    default_pol = Policy()
+    assert default_pol.pii_object_storage_engines == ()
+    assert default_pol.require_filter_min_rows == 100_000
+    assert default_pol.max_in_list == 1_000
+    assert default_pol.max_offset == 10_000
+    assert default_pol.guard_mode == "enforce"
+
+    # Undefined engine in pii_object_storage_engines rejected
+    with pytest.raises(PlacementError, match="pii_object_storage_engines.*ghost"):
+        Placement.from_dict(
+            {
+                "engines": {"pg": {"kind": "postgres", "dialect": "postgres"}},
+                "tables": {"t": {"keys": ["id"], "serve": {"pg": "public.t"}}},
+                "policy": {"pii_object_storage_engines": ["ghost"]},
+            }
+        )
+
+    # Invalid guard_mode rejected
+    with pytest.raises(PlacementError, match="guard_mode"):
+        Policy(guard_mode="ignore")
+

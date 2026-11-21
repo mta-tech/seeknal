@@ -123,7 +123,7 @@ def _assert_typed_error(
 
 
 def test_error_catalogue_contains_all_required_codes_and_is_immutable():
-    assert len(REQUIRED_ERROR_CODES) == 16
+    assert len(REQUIRED_ERROR_CODES) == 22
     for code in REQUIRED_ERROR_CODES:
         assert code in ERROR_CATALOGUE
         spec = ERROR_CATALOGUE[code]
@@ -136,6 +136,8 @@ def test_error_catalogue_contains_all_required_codes_and_is_immutable():
     # Additional HTTP compatibility codes
     assert "not_found" in ERROR_CATALOGUE
     assert "duplicate_query_id" in ERROR_CATALOGUE
+    assert "cursor_key_missing" in ERROR_CATALOGUE
+    assert "cursor_key_weak" in ERROR_CATALOGUE
 
     with pytest.raises(TypeError):
         ERROR_CATALOGUE["tamper"] = ERROR_CATALOGUE["internal_error"]  # type: ignore[index]
@@ -1622,6 +1624,7 @@ def test_c_n3_scrubber_escaped_quotes_all_keys_duckdb_secret_slash_userinfo_and_
             cfg_dict,
             env=harmless_env,
             connect_factories={"sr": lambda: None, "lb": lambda: None},
+            cursor_key="test-typed-errors-cursor-key-32-bytes",
         )
 
         # Also verify direct read_secret_file & ServerConfig.get_env registration
@@ -2083,3 +2086,176 @@ def test_unterminated_quoted_secrets_redacted_up_to_end_of_input():
     )
     assert out_env == "raw leaked [REDACTED] in msg"
     assert "unclosed_env_pw_9988" not in out_env
+
+
+def test_run3_six_new_codes_reachable_over_http(ec_keys):
+    import json
+    from seeknal.serving.lakebase_endpoint import EngineStartingError
+
+    priv, pub = ec_keys
+    placement = Placement.from_dict(
+        {
+            "engines": {
+                "pg": {"kind": "postgres", "dialect": "postgres"},
+            },
+            "tables": {
+                "cbn.rpt.txns": {
+                    "keys": ["txn_id"],
+                    "row_count": 500_000,
+                    "serve": {"pg": "rpt.txns"},
+                    "access": {
+                        "pattern": "filter",
+                        "keys": ["txn_id"],
+                        "filterable": ["customer_id", "as_of_date"],
+                        "range_filterable": ["as_of_date"],
+                        "sortable": ["as_of_date", "txn_id"],
+                        "require_filter": True,
+                        "max_rows": 5000,
+                    },
+                }
+            },
+            "policy": {
+                "max_offset": 1000,
+                "guard_mode": "enforce",
+            },
+        }
+    )
+    schemas = {
+        "cbn.rpt.txns": ["txn_id", "customer_id", "as_of_date", "notes"],
+    }
+    pipeline = ServingPipeline(
+        placement=placement,
+        schemas=schemas,
+        public_keys={"key-1": pub},
+    )
+
+    class StartingAdapter:
+        def execute(self, prepared: PreparedQuery, *, timeout_seconds: float) -> QueryResult:
+            raise EngineStartingError(retry_after=4)
+
+    app = create_app(
+        pipeline,
+        {"pg": StartingAdapter()},
+        cursor_key="test-cursor-secret-key-for-http-reachability",
+    )
+    client = TestClient(app)
+    tables_grant = {
+        "cbn.rpt.txns": {
+            "columns": ["txn_id", "customer_id", "as_of_date", "notes"],
+            "masks": {},
+            "row_filters": [],
+            "actions": ["select"],
+        }
+    }
+
+    sql_unfiltered = "SELECT txn_id, customer_id FROM cbn.rpt.txns"
+    tok_unfiltered = _make_grant(
+        priv, sql_unfiltered, jti="jti-r3-filter-req", tables=tables_grant
+    )
+    resp_fr = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_unfiltered}"},
+        json={"sql": sql_unfiltered},
+    )
+    _assert_typed_error(
+        resp_fr, "filter_required", expected_audit_id="jti-r3-filter-req"
+    )
+
+    sql_bad_sort = (
+        "SELECT txn_id FROM cbn.rpt.txns WHERE customer_id = 'C1' ORDER BY notes"
+    )
+    tok_bad_sort = _make_grant(
+        priv, sql_bad_sort, jti="jti-r3-sort-unidx", tables=tables_grant
+    )
+    resp_sni = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_bad_sort}"},
+        json={"sql": sql_bad_sort},
+    )
+    _assert_typed_error(
+        resp_sni, "sort_not_indexed", expected_audit_id="jti-r3-sort-unidx"
+    )
+
+    sql_bad_offset = (
+        "SELECT txn_id FROM cbn.rpt.txns WHERE customer_id = 'C1' OFFSET 5000"
+    )
+    tok_bad_offset = _make_grant(
+        priv, sql_bad_offset, jti="jti-r3-offset-big", tables=tables_grant
+    )
+    resp_otl = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_bad_offset}"},
+        json={"sql": sql_bad_offset},
+    )
+    _assert_typed_error(
+        resp_otl, "offset_too_large", expected_audit_id="jti-r3-offset-big"
+    )
+
+    bad_select_body = json.dumps(
+        {
+            "table": "cbn.rpt.txns",
+            "columns": ["txn_id"],
+            "where": {"customer_id": {"_unknown_op": "C1"}},
+        }
+    )
+    tok_sel_inv = _make_grant(
+        priv,
+        bad_select_body,
+        jti="jti-r3-select-inv",
+        tables=tables_grant,
+        extra_claims={"api": "select.v1", "sql_dialect": "postgres"},
+    )
+    resp_si = client.post(
+        "/v1/select",
+        headers={
+            "Authorization": f"Bearer {tok_sel_inv}",
+            "Content-Type": "application/json",
+        },
+        content=bad_select_body.encode("utf-8"),
+    )
+    _assert_typed_error(
+        resp_si, "select_invalid", expected_audit_id="jti-r3-select-inv"
+    )
+
+    bad_cursor_body = json.dumps(
+        {
+            "table": "cbn.rpt.txns",
+            "columns": ["txn_id", "as_of_date"],
+            "where": {"customer_id": {"_eq": "C1"}},
+            "order_by": [{"as_of_date": "desc"}, {"txn_id": "desc"}],
+            "after": "tampered.cursor.token",
+        }
+    )
+    tok_cur_inv = _make_grant(
+        priv,
+        bad_cursor_body,
+        jti="jti-r3-cursor-inv",
+        tables=tables_grant,
+        extra_claims={"api": "select.v1", "sql_dialect": "postgres"},
+    )
+    resp_ci = client.post(
+        "/v1/select",
+        headers={
+            "Authorization": f"Bearer {tok_cur_inv}",
+            "Content-Type": "application/json",
+        },
+        content=bad_cursor_body.encode("utf-8"),
+    )
+    _assert_typed_error(
+        resp_ci, "cursor_invalid", expected_audit_id="jti-r3-cursor-inv"
+    )
+
+    sql_starting = "SELECT txn_id FROM cbn.rpt.txns WHERE customer_id = 'C1'"
+    tok_starting = _make_grant(
+        priv, sql_starting, jti="jti-r3-eng-starting", tables=tables_grant
+    )
+    resp_es = client.post(
+        "/v1/query",
+        headers={"Authorization": f"Bearer {tok_starting}"},
+        json={"sql": sql_starting},
+    )
+    _assert_typed_error(
+        resp_es, "engine_starting", expected_audit_id="jti-r3-eng-starting"
+    )
+    assert resp_es.headers.get("Retry-After") == "4"
+

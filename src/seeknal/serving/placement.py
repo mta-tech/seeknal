@@ -10,9 +10,80 @@ from types import MappingProxyType
 import yaml
 from yaml.constructor import ConstructorError
 
-VALID_ENGINE_KINDS = frozenset({"starrocks", "cube", "lakebase", "duckdb"})
+VALID_ENGINE_KINDS = frozenset({"starrocks", "cube", "lakebase", "postgres", "duckdb"})
+VALID_ENGINE_MODES = frozenset({"read_only", "read_write"})
+VALID_ACCESS_PATTERNS = frozenset({"point", "filter", "scan"})
+VALID_GUARD_MODES = frozenset({"enforce", "warn"})
 VALID_TWIN_METHODS = frozenset({"redact", "null", "year", "last4"})
 MAX_SIGNED_INT64 = 9_223_372_036_854_775_807
+
+_VALID_TABLE_ACCESS_KEYS = frozenset(
+    {
+        "pattern",
+        "keys",
+        "filterable",
+        "range_filterable",
+        "prefix_filterable",
+        "sortable",
+        "require_filter",
+        "max_rows",
+    }
+)
+
+
+def is_postgres_wire(kind: str | None) -> bool:
+    """Return True when *kind* is a Postgres-wire engine ('postgres' or 'lakebase')."""
+    return kind in ("postgres", "lakebase")
+
+
+def _validate_col_tuple(
+    val: object,
+    field_name: str,
+    *,
+    context: str,
+) -> tuple[str, ...]:
+    if not isinstance(val, (list, tuple)):
+        raise PlacementError(
+            f"{context} field '{field_name}' must be a list or tuple of non-empty column name strings"
+        )
+    cleaned: list[str] = []
+    for item in val:
+        if not isinstance(item, str) or not item.strip():
+            raise PlacementError(
+                f"{context} field '{field_name}' must contain only non-empty column name strings"
+            )
+        cleaned.append(item.strip())
+    return tuple(cleaned)
+
+
+def _validate_engine_name_tuple(val: object, field_name: str) -> tuple[str, ...]:
+    if not isinstance(val, (list, tuple)):
+        raise PlacementError(
+            f"Policy '{field_name}' must be a list or tuple of non-empty engine name strings"
+        )
+    cleaned: list[str] = []
+    for item in val:
+        if not isinstance(item, str) or not item.strip():
+            raise PlacementError(
+                f"Policy '{field_name}' must contain only non-empty engine name strings"
+            )
+        cleaned.append(item.strip())
+    return tuple(cleaned)
+
+
+def _validate_int_field(
+    val: object,
+    field_name: str,
+    *,
+    min_value: int = 0,
+    context: str = "Policy",
+) -> int:
+    if isinstance(val, bool) or not isinstance(val, int) or val < min_value:
+        bound_desc = "a positive integer" if min_value >= 1 else "a non-negative integer"
+        raise PlacementError(
+            f"{context} '{field_name}' must be {bound_desc}, got {val!r}"
+        )
+    return val
 
 
 def _validate_snapshot_id(value: object, *, context: str = "TableServe") -> int:
@@ -75,6 +146,156 @@ class Engine:
     name: str
     kind: str
     dialect: str
+    mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode is not None:
+            if not isinstance(self.mode, str) or self.mode not in VALID_ENGINE_MODES:
+                raise PlacementError(
+                    f"Engine '{self.name}' has invalid mode '{self.mode}'; "
+                    f"must be 'read_only' or 'read_write'"
+                )
+
+    @property
+    def is_writable(self) -> bool:
+        """Return True if this engine accepts write statements."""
+        if self.kind == "lakebase":
+            return (self.mode or "read_write") == "read_write"
+        if self.kind == "postgres":
+            return self.mode == "read_write"
+        return False
+
+
+@dataclass(frozen=True)
+class TableAccess:
+    """Access pattern and index guardrail metadata for a logical table."""
+
+    pattern: str = "scan"
+    keys: tuple[str, ...] = ()
+    filterable: tuple[str, ...] = ()
+    range_filterable: tuple[str, ...] = ()
+    prefix_filterable: tuple[str, ...] = ()
+    sortable: tuple[str, ...] = ()
+    require_filter: bool = False
+    max_rows: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.pattern, str)
+            or self.pattern not in VALID_ACCESS_PATTERNS
+        ):
+            raise PlacementError(
+                f"TableAccess has invalid pattern '{self.pattern}'; "
+                f"must be one of {sorted(VALID_ACCESS_PATTERNS)}"
+            )
+        for fname in (
+            "keys",
+            "filterable",
+            "range_filterable",
+            "prefix_filterable",
+            "sortable",
+        ):
+            cleaned = _validate_col_tuple(
+                getattr(self, fname), fname, context="TableAccess"
+            )
+            object.__setattr__(self, fname, cleaned)
+        if not isinstance(self.require_filter, bool):
+            raise PlacementError(
+                f"TableAccess field 'require_filter' must be a boolean, "
+                f"got {type(self.require_filter).__name__}"
+            )
+        if self.max_rows is not None:
+            if (
+                isinstance(self.max_rows, bool)
+                or not isinstance(self.max_rows, int)
+                or self.max_rows <= 0
+            ):
+                raise PlacementError(
+                    f"TableAccess field 'max_rows' must be a positive integer or None, "
+                    f"got {self.max_rows!r}"
+                )
+
+    @classmethod
+    def from_dict(
+        cls,
+        raw: Mapping,
+        *,
+        table_name: str = "",
+        table_keys: tuple[str, ...] | list[str] = (),
+    ) -> TableAccess:
+        """Construct TableAccess from a raw mapping."""
+        ctx = f"Table '{table_name}' access" if table_name else "TableAccess"
+        if not isinstance(raw, Mapping):
+            raise PlacementError(
+                f"{ctx} must be a mapping, got {type(raw).__name__}"
+            )
+        unknown = set(raw.keys()) - _VALID_TABLE_ACCESS_KEYS
+        if unknown:
+            raise PlacementError(
+                f"{ctx} contains unknown field(s): "
+                f"{', '.join(sorted(str(k) for k in unknown))}"
+            )
+        pattern = raw.get("pattern", "scan")
+        if not isinstance(pattern, str) or pattern not in VALID_ACCESS_PATTERNS:
+            raise PlacementError(
+                f"{ctx} has invalid pattern '{pattern}'; "
+                f"must be one of {sorted(VALID_ACCESS_PATTERNS)}"
+            )
+        keys = _validate_col_tuple(raw.get("keys", ()), "keys", context=ctx)
+        clean_table_keys = (
+            _validate_col_tuple(table_keys, "keys", context=ctx)
+            if table_keys
+            else ()
+        )
+        effective_keys = keys if keys else clean_table_keys
+        if pattern == "point" and not effective_keys:
+            raise PlacementError(
+                f"{ctx} with pattern 'point' requires non-empty 'keys'"
+            )
+        filterable = _validate_col_tuple(
+            raw.get("filterable", ()), "filterable", context=ctx
+        )
+        range_filterable = _validate_col_tuple(
+            raw.get("range_filterable", ()), "range_filterable", context=ctx
+        )
+        prefix_filterable = _validate_col_tuple(
+            raw.get("prefix_filterable", ()), "prefix_filterable", context=ctx
+        )
+        sortable = _validate_col_tuple(
+            raw.get("sortable", ()), "sortable", context=ctx
+        )
+        if "require_filter" in raw:
+            require_filter = raw["require_filter"]
+            if not isinstance(require_filter, bool):
+                raise PlacementError(
+                    f"{ctx} field 'require_filter' must be a boolean, "
+                    f"got {type(require_filter).__name__}"
+                )
+        else:
+            require_filter = pattern in ("point", "filter")
+
+        max_rows = raw.get("max_rows", None)
+        if max_rows is not None:
+            if (
+                isinstance(max_rows, bool)
+                or not isinstance(max_rows, int)
+                or max_rows <= 0
+            ):
+                raise PlacementError(
+                    f"{ctx} field 'max_rows' must be a positive integer or None, "
+                    f"got {max_rows!r}"
+                )
+
+        return cls(
+            pattern=pattern,
+            keys=effective_keys,
+            filterable=filterable,
+            range_filterable=range_filterable,
+            prefix_filterable=prefix_filterable,
+            sortable=sortable,
+            require_filter=require_filter,
+            max_rows=max_rows,
+        )
 
 
 @dataclass(frozen=True)
@@ -103,12 +324,36 @@ class TableEntry:
     row_count: int | None
     serves: tuple[TableServe, ...]
     pii: bool = False
+    tokenized: bool = False
+    access: TableAccess | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.keys, tuple):
+            object.__setattr__(self, "keys", tuple(self.keys))
         if not isinstance(self.pii, bool):
             raise PlacementError(
                 f"Table '{self.name}' field 'pii' must be a boolean, got {type(self.pii).__name__}"
             )
+        if not isinstance(self.tokenized, bool):
+            raise PlacementError(
+                f"Table '{self.name}' field 'tokenized' must be a boolean, got {type(self.tokenized).__name__}"
+            )
+        if self.access is not None:
+            if not isinstance(self.access, TableAccess):
+                raise PlacementError(
+                    f"Table '{self.name}' field 'access' must be a TableAccess or None, "
+                    f"got {type(self.access).__name__}"
+                )
+            if not self.keys and self.access.keys:
+                object.__setattr__(self, "keys", self.access.keys)
+            elif self.keys and not self.access.keys:
+                object.__setattr__(
+                    self, "access", replace(self.access, keys=self.keys)
+                )
+            if self.access.pattern == "point" and not self.access.keys:
+                raise PlacementError(
+                    f"Table '{self.name}' access with pattern 'point' requires non-empty 'keys'"
+                )
 
 
 @dataclass(frozen=True)
@@ -161,20 +406,43 @@ class Policy:
     small_scan_order: tuple[str, ...] = ("lakebase", "starrocks", "duckdb")
     analytics_order: tuple[str, ...] = ("starrocks", "duckdb")
     pii_engines: tuple[str, ...] = ()
+    pii_object_storage_engines: tuple[str, ...] = ()
+    require_filter_min_rows: int = 100_000
+    max_in_list: int = 1_000
+    max_offset: int = 10_000
+    guard_mode: str = "enforce"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.pii_engines, (list, tuple)):
+        _validate_int_field(
+            self.point_lookup_max_keys, "point_lookup_max_keys", min_value=1
+        )
+        _validate_int_field(
+            self.analytics_min_rows, "analytics_min_rows", min_value=0
+        )
+        _validate_int_field(
+            self.require_filter_min_rows, "require_filter_min_rows", min_value=0
+        )
+        _validate_int_field(self.max_in_list, "max_in_list", min_value=1)
+        _validate_int_field(self.max_offset, "max_offset", min_value=0)
+        if (
+            not isinstance(self.guard_mode, str)
+            or self.guard_mode not in VALID_GUARD_MODES
+        ):
             raise PlacementError(
-                "Policy 'pii_engines' must be a list or tuple of non-empty engine name strings"
+                f"Policy 'guard_mode' must be 'enforce' or 'warn', got {self.guard_mode!r}"
             )
-        cleaned: list[str] = []
-        for item in self.pii_engines:
-            if not isinstance(item, str) or not item.strip():
-                raise PlacementError(
-                    "Policy 'pii_engines' must contain only non-empty engine name strings"
-                )
-            cleaned.append(item.strip())
-        object.__setattr__(self, "pii_engines", tuple(cleaned))
+        object.__setattr__(
+            self,
+            "pii_engines",
+            _validate_engine_name_tuple(self.pii_engines, "pii_engines"),
+        )
+        object.__setattr__(
+            self,
+            "pii_object_storage_engines",
+            _validate_engine_name_tuple(
+                self.pii_object_storage_engines, "pii_object_storage_engines"
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -198,11 +466,16 @@ class Placement:
                     f"Unknown engine kind '{engine.kind}' for engine '{engine.name}'"
                 )
 
-        # Validate policy.pii_engines
+        # Validate policy.pii_engines and policy.pii_object_storage_engines
         for pii_eng in self.policy.pii_engines:
             if pii_eng not in self.engines:
                 raise PlacementError(
                     f"Policy 'pii_engines' references undefined engine '{pii_eng}'"
+                )
+        for pii_obj_eng in self.policy.pii_object_storage_engines:
+            if pii_obj_eng not in self.engines:
+                raise PlacementError(
+                    f"Policy 'pii_object_storage_engines' references undefined engine '{pii_obj_eng}'"
                 )
 
         # Validate tables and collision
@@ -236,7 +509,12 @@ class Placement:
                         f"Table '{table.name}' has empty physical name for engine '{serve.engine}'"
                     )
 
-            if table.pii:
+            if not isinstance(table.tokenized, bool):
+                raise PlacementError(
+                    f"Table '{table.name}' field 'tokenized' must be a boolean, got {type(table.tokenized).__name__}"
+                )
+
+            if table.pii and not table.tokenized:
                 if len(table.serves) != 1:
                     raise PlacementError(
                         f"PII table '{table.name}' must have exactly one serve, got {len(table.serves)}"
@@ -329,9 +607,35 @@ class Placement:
         for eng_name, eng_spec in engines_raw.items():
             if not eng_name or not str(eng_name).strip():
                 raise PlacementError("Engine name cannot be empty")
+            if not isinstance(eng_spec, Mapping):
+                raise PlacementError(
+                    f"Engine '{eng_name}' specification must be a mapping"
+                )
+            if "storage_class" in eng_spec:
+                raise PlacementError(
+                    f"Engine '{eng_name}' cannot declare 'storage_class' in placement.engines; "
+                    f"declare 'storage_class' on connections.{eng_name} instead"
+                )
             kind = eng_spec.get("kind", "")
             dialect = eng_spec.get("dialect", "")
-            engines[eng_name] = Engine(name=str(eng_name), kind=kind, dialect=dialect)
+            has_mode = "mode" in eng_spec and eng_spec["mode"] is not None
+            has_ep = (
+                "endpoint_type" in eng_spec
+                and eng_spec["endpoint_type"] is not None
+            )
+            if has_mode and has_ep and eng_spec["mode"] != eng_spec["endpoint_type"]:
+                raise PlacementError(
+                    f"Engine '{eng_name}' specifies conflicting 'mode' ({eng_spec['mode']!r}) "
+                    f"and 'endpoint_type' ({eng_spec['endpoint_type']!r})"
+                )
+            mode = (
+                eng_spec["mode"]
+                if "mode" in eng_spec and eng_spec["mode"] is not None
+                else eng_spec.get("endpoint_type")
+            )
+            engines[str(eng_name)] = Engine(
+                name=str(eng_name), kind=kind, dialect=dialect, mode=mode
+            )
 
         # 2. Tables
         tables: dict[str, TableEntry] = {}
@@ -387,12 +691,31 @@ class Placement:
                     f"Table '{tbl_name}' field 'pii' must be a boolean, got {type(pii_raw).__name__}"
                 )
 
+            tokenized_raw = tbl_spec.get("tokenized", False)
+            if not isinstance(tokenized_raw, bool):
+                raise PlacementError(
+                    f"Table '{tbl_name}' field 'tokenized' must be a boolean, got {type(tokenized_raw).__name__}"
+                )
+
+            access_raw = tbl_spec.get("access")
+            access_obj: TableAccess | None
+            if access_raw is None:
+                access_obj = None
+            elif isinstance(access_raw, TableAccess):
+                access_obj = access_raw
+            else:
+                access_obj = TableAccess.from_dict(
+                    access_raw, table_name=str(tbl_name), table_keys=keys
+                )
+
             tables[str(tbl_name)] = TableEntry(
                 name=str(tbl_name),
                 keys=keys,
                 row_count=row_count,
                 serves=tuple(serves),
                 pii=pii_raw,
+                tokenized=tokenized_raw,
+                access=access_obj,
             )
 
         # 3. Cubes
@@ -435,13 +758,41 @@ class Placement:
         else:
             if not isinstance(policy_raw, Mapping):
                 raise PlacementError("'policy' must be a mapping")
-            kwargs = {}
+            kwargs: dict[str, object] = {}
             if "point_lookup_max_keys" in policy_raw:
-                kwargs["point_lookup_max_keys"] = int(
-                    policy_raw["point_lookup_max_keys"]
+                raw_plmk = policy_raw["point_lookup_max_keys"]
+                if isinstance(raw_plmk, bool):
+                    raise PlacementError(
+                        "Policy 'point_lookup_max_keys' must be a positive integer"
+                    )
+                try:
+                    coerced_plmk = int(raw_plmk)
+                except (ValueError, TypeError) as exc:
+                    raise PlacementError(
+                        f"Policy 'point_lookup_max_keys' must be a positive integer, got {raw_plmk!r}"
+                    ) from exc
+                kwargs["point_lookup_max_keys"] = _validate_int_field(
+                    coerced_plmk,
+                    "point_lookup_max_keys",
+                    min_value=1,
                 )
             if "analytics_min_rows" in policy_raw:
-                kwargs["analytics_min_rows"] = int(policy_raw["analytics_min_rows"])
+                raw_amr = policy_raw["analytics_min_rows"]
+                if isinstance(raw_amr, bool):
+                    raise PlacementError(
+                        "Policy 'analytics_min_rows' must be a non-negative integer"
+                    )
+                try:
+                    coerced_amr = int(raw_amr)
+                except (ValueError, TypeError) as exc:
+                    raise PlacementError(
+                        f"Policy 'analytics_min_rows' must be a non-negative integer, got {raw_amr!r}"
+                    ) from exc
+                kwargs["analytics_min_rows"] = _validate_int_field(
+                    coerced_amr,
+                    "analytics_min_rows",
+                    min_value=0,
+                )
             if "small_scan_order" in policy_raw:
                 kwargs["small_scan_order"] = tuple(
                     str(x) for x in policy_raw["small_scan_order"]
@@ -451,19 +802,30 @@ class Placement:
                     str(x) for x in policy_raw["analytics_order"]
                 )
             if "pii_engines" in policy_raw:
-                raw_pii_engines = policy_raw["pii_engines"]
-                if not isinstance(raw_pii_engines, (list, tuple)):
-                    raise PlacementError(
-                        "Policy 'pii_engines' must be a list or tuple of non-empty engine name strings"
-                    )
-                parsed_pii_engines: list[str] = []
-                for item in raw_pii_engines:
-                    if not isinstance(item, str) or not item.strip():
-                        raise PlacementError(
-                            "Policy 'pii_engines' must contain only non-empty engine name strings"
-                        )
-                    parsed_pii_engines.append(item.strip())
-                kwargs["pii_engines"] = tuple(parsed_pii_engines)
+                kwargs["pii_engines"] = _validate_engine_name_tuple(
+                    policy_raw["pii_engines"], "pii_engines"
+                )
+            if "pii_object_storage_engines" in policy_raw:
+                kwargs["pii_object_storage_engines"] = _validate_engine_name_tuple(
+                    policy_raw["pii_object_storage_engines"],
+                    "pii_object_storage_engines",
+                )
+            if "require_filter_min_rows" in policy_raw:
+                kwargs["require_filter_min_rows"] = _validate_int_field(
+                    policy_raw["require_filter_min_rows"],
+                    "require_filter_min_rows",
+                    min_value=0,
+                )
+            if "max_in_list" in policy_raw:
+                kwargs["max_in_list"] = _validate_int_field(
+                    policy_raw["max_in_list"], "max_in_list", min_value=1
+                )
+            if "max_offset" in policy_raw:
+                kwargs["max_offset"] = _validate_int_field(
+                    policy_raw["max_offset"], "max_offset", min_value=0
+                )
+            if "guard_mode" in policy_raw:
+                kwargs["guard_mode"] = policy_raw["guard_mode"]
             policy = Policy(**kwargs)
 
         # 5. Fold top-level pii_tables and policy.pii_tables into TableEntry.pii / CubeEntry.pii

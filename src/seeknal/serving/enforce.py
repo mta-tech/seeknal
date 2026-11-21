@@ -151,9 +151,10 @@ def apply_null_ordering(
 VALID_MASKS = frozenset({"redact", "null", "hash", "last4", "year"})
 VALID_OPS = frozenset({"eq", "in", "gte", "lte"})
 VALID_ACTIONS = frozenset({"select", "insert", "update", "delete"})
-VALID_TARGET_KINDS = frozenset({"starrocks", "lakebase", "duckdb", "cube"})
+VALID_TARGET_KINDS = frozenset({"starrocks", "lakebase", "postgres", "duckdb", "cube"})
 VALID_TARGET_DIALECTS = frozenset({"postgres", "starrocks", "duckdb"})
 VALID_SQL_DIALECTS = frozenset({"postgres", "starrocks", "mysql", "duckdb"})
+VALID_APIS = frozenset({"select.v1"})
 VALID_WORKLOADS = frozenset({"interactive", "bi", "report", "ask", "job"})
 VALID_ORIGINS = frozenset({"superset", "ask", "job", "portal"})
 VALID_ACT_TYPES = frozenset({"ask_session", "run"})
@@ -165,6 +166,7 @@ ANONYMOUS_FUNCTION_ALLOWLIST: dict[str, set[str]] = {
     "cube": {"measure"},
     "starrocks": set(),
     "lakebase": set(),
+    "postgres": set(),
     "duckdb": set(),
 }
 
@@ -340,6 +342,7 @@ class Grant:
     params_sha256: str | None = None
     operation_id: str | None = None
     operation_version: int | None = None
+    api: str | None = None
 
     @property
     def is_named_operation(self) -> bool:
@@ -355,6 +358,24 @@ class Grant:
             raise EnforcementError(f"max_rows must be positive, got {self.max_rows}")
         if not self.tables:
             raise EnforcementError("empty table list in grant")
+        if self.api is not None:
+            if (
+                isinstance(self.api, bool)
+                or not isinstance(self.api, str)
+                or self.api not in VALID_APIS
+            ):
+                raise EnforcementError("invalid 'api' claim", code="grant_invalid")
+            if self.api == "select.v1":
+                if self.sql_dialect != "postgres":
+                    raise EnforcementError(
+                        "select.v1 requires sql_dialect 'postgres'",
+                        code="grant_invalid",
+                    )
+                if self.params_sha256 is not None:
+                    raise EnforcementError(
+                        "select.v1 grant must not include params_sha256",
+                        code="grant_invalid",
+                    )
         if not isinstance(self.sql_dialect, str) or self.sql_dialect not in VALID_SQL_DIALECTS:
             raise EnforcementError(
                 f"invalid sql_dialect '{self.sql_dialect}', must be one of {sorted(VALID_SQL_DIALECTS)}"
@@ -465,14 +486,36 @@ class Grant:
         if not tables_raw:
             raise EnforcementError("empty table list in grant claims")
 
+        api: str | None = None
+        if "api" in claims and claims["api"] is not None:
+            api_val = claims["api"]
+            if (
+                isinstance(api_val, bool)
+                or not isinstance(api_val, str)
+                or api_val not in VALID_APIS
+            ):
+                raise EnforcementError("invalid 'api' claim", code="grant_invalid")
+            api = api_val
+
         if "sql_dialect" in claims:
             sql_dialect = claims["sql_dialect"]
+            if api == "select.v1" and sql_dialect != "postgres":
+                raise EnforcementError(
+                    "select.v1 requires sql_dialect 'postgres'",
+                    code="grant_invalid",
+                )
             if not isinstance(sql_dialect, str) or sql_dialect not in VALID_SQL_DIALECTS:
                 raise EnforcementError(
                     f"invalid sql_dialect '{sql_dialect}', must be one of {sorted(VALID_SQL_DIALECTS)}"
                 )
         else:
             sql_dialect = "postgres"
+
+        if api == "select.v1" and claims.get("params_sha256") is not None:
+            raise EnforcementError(
+                "select.v1 grant must not include params_sha256",
+                code="grant_invalid",
+            )
 
         if "workload" in claims:
             workload = claims["workload"]
@@ -618,6 +661,7 @@ class Grant:
             params_sha256=params_sha256,
             operation_id=operation_id,
             operation_version=operation_version,
+            api=api,
         )
 
 
@@ -634,10 +678,14 @@ class EnforcedQuery:
     cube_security_context: Mapping[str, Any] | None
 
 
-def _build_row_filter_node(rf: RowFilter) -> exp.Expression:
+def _build_row_filter_node(rf: RowFilter, *, quoted: bool = False) -> exp.Expression:
     """Construct an AST predicate node for a RowFilter using sqlglot literals."""
     op = rf.op.lower()
-    col = exp.to_column(rf.column)
+    col = (
+        exp.Column(this=exp.Identifier(this=rf.column, quoted=True))
+        if quoted
+        else exp.to_column(rf.column)
+    )
     if op == "eq":
         val = rf.values[0]
         if val is None:
@@ -652,7 +700,9 @@ def _build_row_filter_node(rf: RowFilter) -> exp.Expression:
     raise EnforcementError(f"unsupported row filter op: {rf.op}")
 
 
-def _build_mask_expression(method: str, col_name: str, target_dialect: str) -> exp.Expression:
+def _build_mask_expression(
+    method: str, col_name: str, target_dialect: str, *, quoted: bool = False
+) -> exp.Expression:
     """Build a mask expression for a column and method in the target dialect."""
     method_lower = method.lower()
     if method_lower not in MASK_TEMPLATES:
@@ -663,9 +713,14 @@ def _build_mask_expression(method: str, col_name: str, target_dialect: str) -> e
 
     template = dialect_templates[target_dialect]
     parsed = sqlglot.parse_one(template, read=target_dialect)
+    replacement_col = (
+        exp.Column(this=exp.Identifier(this=col_name, quoted=True))
+        if quoted
+        else exp.to_column(col_name)
+    )
     for col_node in parsed.find_all(exp.Column):
         if col_node.name.lower() == "c":
-            col_node.replace(exp.to_column(col_name))
+            col_node.replace(replacement_col.copy())
     return parsed
 
 
@@ -844,7 +899,7 @@ def _is_member_projected_bare(col: exp.Column, statement: exp.Expression) -> boo
 
 
 def enforce(
-    sql: str,
+    sql: str | bytes,
     grant: Grant,
     *,
     schemas: Mapping[str, Sequence[str]],
@@ -860,14 +915,25 @@ def enforce(
     params: Sequence[Any] | None = None,
     on_row_cap: str = "truncate",
 ) -> EnforcedQuery:
-    """Enforce a data catalog grant on a SQL query."""
+    """Enforce a data catalog grant on a SQL query or governed request body."""
     if cube_mode not in ("refuse", "jwt"):
         raise EnforcementError(f"invalid cube_mode '{cube_mode}', must be 'refuse' or 'jwt'")
     if on_row_cap not in ("truncate", "error"):
         raise EnforcementError(f"invalid on_row_cap '{on_row_cap}', must be 'truncate' or 'error'")
+    if not isinstance(sql, (str, bytes)):
+        raise EnforcementError("SQL query must be a string or bytes", code="invalid_sql")
+
     # Step 1: Integrity
-    computed_sha256 = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+    if isinstance(sql, bytes):
+        computed_sha256 = hashlib.sha256(sql).hexdigest()
+    else:
+        computed_sha256 = hashlib.sha256(sql.encode("utf-8")).hexdigest()
     if computed_sha256.lower() != grant.sql_sha256.lower():
+        if grant.api == "select.v1":
+            raise EnforcementError(
+                f"SQL SHA256 mismatch: expected {grant.sql_sha256}, got {computed_sha256}",
+                code="grant_invalid",
+            )
         raise EnforcementError(
             f"SQL SHA256 mismatch: expected {grant.sql_sha256}, got {computed_sha256}"
         )
@@ -892,7 +958,8 @@ def enforce(
         statement = statement.copy()
     else:
         try:
-            parsed_statements = sqlglot.parse(sql, read=dialect)
+            sql_text = sql.decode("utf-8") if isinstance(sql, bytes) else sql
+            parsed_statements = sqlglot.parse(sql_text, read=dialect)
         except Exception as exc:
             raise EnforcementError(
                 f"SQL parse error: {exc}", code="invalid_sql"
@@ -965,6 +1032,18 @@ def enforce(
                 )
 
     # Step 3: Action
+    for cte in statement.find_all(exp.CTE):
+        if cte.find((exp.Insert, exp.Update, exp.Delete, exp.Merge)) is not None:
+            raise EnforcementError(
+                "DML statements inside CTEs or subqueries are not permitted"
+            )
+    if isinstance(statement, exp.Query) and statement.find(
+        (exp.Insert, exp.Update, exp.Delete, exp.Merge)
+    ) is not None:
+        raise EnforcementError(
+            "DML statements inside CTEs or subqueries are not permitted"
+        )
+
     target_table_ref: exp.Table | None = None
     if isinstance(statement, exp.Query):
         for tbl_key in referenced_table_keys:
@@ -1354,23 +1433,39 @@ def enforce(
             visible_cols_map = {c.lower(): c for c in table_grant.columns}
             masks_cols_map = {c.lower(): (c, m) for c, m in table_grant.masks.items()}
 
+            quote_idents = grant.api == "select.v1"
             inner_projections: list[exp.Expression] = []
             for col_name in schema_cols:
                 col_lower = col_name.lower()
                 if col_lower in visible_cols_map:
-                    inner_projections.append(exp.to_column(col_name))
+                    inner_projections.append(
+                        exp.Column(this=exp.Identifier(this=col_name, quoted=True))
+                        if quote_idents
+                        else exp.to_column(col_name)
+                    )
                 elif col_lower in masks_cols_map:
                     orig_name, mask_method = masks_cols_map[col_lower]
-                    mask_expr = _build_mask_expression(mask_method, orig_name, target_dialect_lower)
-                    inner_projections.append(exp.alias_(mask_expr, orig_name))
+                    mask_expr = _build_mask_expression(
+                        mask_method, orig_name, target_dialect_lower, quoted=quote_idents
+                    )
+                    inner_projections.append(
+                        exp.alias_(mask_expr, orig_name, quoted=quote_idents)
+                    )
 
             sub = exp.select(*inner_projections).from_(exp.to_table(canonical_tbl))
             if table_grant.row_filters:
-                filter_nodes = [_build_row_filter_node(rf) for rf in table_grant.row_filters]
+                filter_nodes = [
+                    _build_row_filter_node(rf, quoted=quote_idents)
+                    for rf in table_grant.row_filters
+                ]
                 sub = sub.where(exp.and_(*filter_nodes))
 
             derived_alias = tbl.alias or tbl.name
-            derived_table = sub.subquery(alias=derived_alias)
+            derived_table = sub.subquery(
+                alias=exp.Identifier(this=derived_alias, quoted=True)
+                if quote_idents
+                else derived_alias
+            )
             tbl.replace(derived_table)
 
         # Clear catalog/db qualifications on outer columns matching unaliased tables
