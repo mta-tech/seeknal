@@ -653,3 +653,24 @@ def test_upstream_notice_truncates_long_lists(capsys):
     out = " ".join(capsys.readouterr().out.split())  # console may wrap long lines
     assert "12 upstream node(s)" in out
     assert "transform.n00, transform.n01, transform.n02, ... (+9 more)" in out
+
+
+def test_run_parallel_exits_nonzero_when_any_node_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """`seeknal run --parallel` must exit 1 when any node fails, matching sequential `seeknal run`."""
+    monkeypatch.delenv("ATLAS_API_URL", raising=False)
+    monkeypatch.delenv("ATLAS_PORTAL_URL", raising=False)
+    monkeypatch.delenv("KEYCLOAK_ISSUER", raising=False)
+
+    transforms_dir = tmp_path / "seeknal" / "transforms"
+    transforms_dir.mkdir(parents=True)
+    (transforms_dir / "bad_sql.yml").write_text(
+        "kind: transform\n"
+        "name: bad_sql\n"
+        "transform: SELECT * FROM nonexistent_table_xyz\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["run", "--parallel"])
+    assert result.exit_code == 1
+

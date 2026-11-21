@@ -17,7 +17,7 @@ Seeknal uses YAML files to define data pipelines. Each YAML file represents a **
 | `second_order_aggregation` | Aggregations of aggregations | Region-level from user-level metrics |
 | `model` | ML model training and inference | Churn prediction, classification |
 | `rule` | Data quality and validation rules | Non-null checks, value ranges |
-| `exposure` | Data export to external systems | API endpoints, file exports, databases |
+| `exposure` | Data export to external systems | API endpoints, file exports, notifications |
 | `semantic_model` | Semantic layer definitions | Business metrics, dimensions |
 | `metric` | Business metric calculations | Revenue, conversion rates |
 
@@ -727,13 +727,13 @@ tags:
 
 ## Exposure
 
-Exposures define data exports to external systems (files, APIs, databases).
+Exposures define data exports to external systems (files, APIs, notifications, StarRocks materialized views, and reports).
 
 ### Fields
 
 | Field | Type | Required | Description | Default |
 |-------|------|----------|-------------|---------|
-| `type` | string | **Yes** | Exposure type: `file`, `api`, `database` | - |
+| `type` | string | **Yes** | Exposure type: `file`, `api`, `notification`, `starrocks_materialized_view`, `report` (`database` is **not implemented** and fails validation; use [`materializations:`](#multi-target-materialization) instead) | - |
 | `url` | string | Depends | API endpoint URL (for `type: api`) | - |
 | `params` | object | Depends | Type-specific parameters (see [Exposure Params](#exposure-params)) | `{}` |
 | `inputs` | list[object] | **Yes** | Dependencies (data to export) | - |
@@ -766,14 +766,10 @@ params:
   refresh_interval: 3600       # Seconds between refreshes
 ```
 
-**Database export:**
-```yaml
-type: database
-params:
-  connection_string: "postgresql://host/db"
-  table: production.results
-  mode: overwrite              # overwrite, append
-```
+**Database export (not implemented):**
+
+!!! warning "`type: database` is not implemented"
+    `kind: exposure` with `type: database` is not implemented and is rejected at validation and execution time (it previously acted as a no-op stub that wrote 0 rows). To write pipeline outputs to a database or table format, configure [`materializations:`](#multi-target-materialization) (`type: postgresql` or `type: iceberg`) directly on the producing `transform`, `source`, or `feature_group` node, or use a `type: file` exposure.
 
 ### Example (File)
 
@@ -1134,6 +1130,14 @@ Write pipeline outputs to multiple storage targets simultaneously using the plur
 | `when_not_matched` | string | No | Iceberg `upsert` new-key policy: `insert` or `skip` | `insert` |
 | `time_column` | string | For `incremental_by_time` | Time column for range-based incremental | - |
 | `lookback` | string | No | Lookback window for incremental (e.g., `7d`) | - |
+| `required` | boolean | No | For `postgresql` targets: whether a target failure marks the node `FAILED` (`false` opts into best-effort execution) | `true` |
+
+### Failure Semantics, Execution Order, and Partial Success
+
+- **PostgreSQL targets are required by default (`required: true`).** When a `postgresql` target fails, the node ends `FAILED` with an error message naming the failed target label (e.g., `transform.enriched_orders[0]:postgresql`) and its `failure_category`, and `seeknal run` (both sequential and `--parallel`) exits non-zero. DSN userinfo and `password=...` credentials are scrubbed from logs, metadata, and error messages.
+- **Opt-out (`required: false`).** Set `required: false` on a `postgresql` target to keep best-effort behaviour for that target: the node stays `SUCCESS` and the failure is recorded in `metadata.materialization.results`.
+- **Asymmetry with Iceberg targets.** Iceberg `append` and `overwrite` targets remain best-effort by default, whereas Iceberg advanced modes (`upsert` and `insert_overwrite`) and `postgresql` targets are required by default.
+- **Execution order and partial success (no cross-target rollback).** All targets in `materializations:` still run in YAML list order even if an earlier target fails. Targets that succeeded are **not** rolled back when another target on the same node fails; `metadata.materialization.results` reports each target's outcome so partial success is visible.
 
 ### Write Modes
 

@@ -711,6 +711,18 @@ def execute_exposure(
     exposure_type = yaml_data.get("type", "unknown")
     url = yaml_data.get("url", "")
 
+    if not isinstance(exposure_type, str) or not exposure_type.strip():
+        raise ValueError(
+            f"Invalid exposure type: expected non-empty string, got {type(exposure_type).__name__}"
+        )
+
+    if exposure_type.strip().lower() == "database":
+        from seeknal.workflow.executors.exposure_executor import (
+            DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
+        )
+
+        raise ValueError(DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE)
+
     # Show exposure info
     _echo_info(f"Exposure: {name}")
     _echo_info(f"Type: {exposure_type}")

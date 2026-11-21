@@ -345,6 +345,7 @@ class HeartbeatRunner:
                 ExecutionStatus,
             )
             from seeknal.workflow.executors.exposure_executor import (
+                DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
                 ExposureExecutor,
             )
             from seeknal.workflow.manifest_builder import build_manifest_from_dag
@@ -378,33 +379,43 @@ class HeartbeatRunner:
             n for n in manifest.nodes.values() if n.node_type == NodeType.EXPOSURE
         ]
         for node in exposures:
+            target = str(node.config.get("target", "?")) if node.config else "?"
+            raw_type = node.config.get("type") if node.config else None
+            exposure_type = raw_type.strip().lower() if isinstance(raw_type, str) else ""
             try:
                 executor = ExposureExecutor(node, exec_context)
                 exec_result = executor.run()
-                status = (
-                    "ok"
-                    if exec_result.status == ExecutionStatus.SUCCESS
-                    else "failed"
-                )
-                target = str(node.config.get("target", "?")) if node.config else "?"
+                if exposure_type == "database":
+                    status = "failed"
+                    error_message = (
+                        exec_result.error_message
+                        or DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE
+                    )
+                else:
+                    status = (
+                        "ok"
+                        if exec_result.status == ExecutionStatus.SUCCESS
+                        else "failed"
+                    )
+                    error_message = exec_result.error_message
                 results.append(
                     ExposureResult(
                         node=node.id,
                         target=target,
                         status=status,  # type: ignore[arg-type]
-                        error=exec_result.error_message,
+                        error=error_message,
                     )
                 )
                 if status == "failed":
                     errors.append(
-                        f"Exposure {node.id} failed: {exec_result.error_message}"
+                        f"Exposure {node.id} failed: {error_message}"
                     )
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"Exposure node {node.id} crashed: {exc}")
                 results.append(
                     ExposureResult(
                         node=node.id,
-                        target="?",
+                        target=target,
                         status="failed",
                         error=str(exc),
                     )

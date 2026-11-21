@@ -179,6 +179,19 @@ class ProjectParser:
         if has_cycle:
             errors.append(f"Cycle detected in DAG: {' -> '.join(cycle_path)}")
 
+        # Check for unsupported exposure types
+        for node_id, node in self.manifest.nodes.items():
+            if node.node_type == NodeType.EXPOSURE:
+                exposure_type = (node.config or {}).get("type")
+                if isinstance(exposure_type, str) and exposure_type.strip().lower() == "database":
+                    from seeknal.workflow.executors.exposure_executor import (
+                        DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
+                    )
+
+                    errors.append(
+                        f"Node '{node_id}': {DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE}"
+                    )
+
         return errors
 
     def get_warnings(self) -> list[str]:

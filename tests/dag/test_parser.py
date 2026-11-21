@@ -99,3 +99,20 @@ rules:
         errors = parser.validate()
         assert len(errors) > 0
         assert "source.missing" in errors[0]
+
+    def test_parser_does_not_include_exposures_in_public_manifest(self, tmp_path: Path):
+        """ProjectParser.parse() preserves the base public manifest without parsing exposures."""
+        exp_dir = tmp_path / "seeknal" / "exposures"
+        exp_dir.mkdir(parents=True)
+        (exp_dir / "db_export.yml").write_text(
+            "kind: exposure\n"
+            "name: db_export\n"
+            "type: database\n",
+            encoding="utf-8",
+        )
+        parser = ProjectParser(project_name="test_project", project_path=str(tmp_path))
+        manifest = parser.parse()
+
+        assert "exposure.db_export" not in manifest.nodes
+        assert parser.get_errors() == []
+

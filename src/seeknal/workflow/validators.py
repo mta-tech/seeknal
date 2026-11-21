@@ -154,6 +154,48 @@ def validate_schema(yaml_data: Dict[str, Any]) -> None:
         _echo_error(f"Missing required fields for {kind}: {', '.join(missing_fields)}")
         raise typer.Exit(1)
 
+    if kind == "exposure":
+        exposure_type = yaml_data.get("type")
+        if not isinstance(exposure_type, str) or not exposure_type.strip():
+            _echo_error(
+                f"Invalid field 'type' for exposure: expected non-empty string, "
+                f"got {type(exposure_type).__name__}"
+            )
+            raise typer.Exit(1)
+        if exposure_type.strip().lower() == "database":
+            from seeknal.workflow.executors.exposure_executor import (
+                DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE,
+            )
+
+            _echo_error(DATABASE_EXPOSURE_NOT_IMPLEMENTED_MESSAGE)
+            raise typer.Exit(1)
+
+    mats = yaml_data.get("materializations")
+    if isinstance(mats, list):
+        for target in mats:
+            if (
+                isinstance(target, dict)
+                and "required" in target
+                and not isinstance(target["required"], bool)
+            ):
+                _echo_error(
+                    f"Invalid field 'required' in materializations target: expected boolean, "
+                    f"got {type(target['required']).__name__}"
+                )
+                raise typer.Exit(1)
+
+    mat_single = yaml_data.get("materialization")
+    if (
+        isinstance(mat_single, dict)
+        and "required" in mat_single
+        and not isinstance(mat_single["required"], bool)
+    ):
+        _echo_error(
+            f"Invalid field 'required' in materialization target: expected boolean, "
+            f"got {type(mat_single['required']).__name__}"
+        )
+        raise typer.Exit(1)
+
 
 def validate_dependencies(yaml_data: Dict[str, Any]) -> None:
     """Validate dependencies (refs to upstream nodes).

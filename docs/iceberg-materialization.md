@@ -476,9 +476,16 @@ An identical successful upsert can be rerun without creating duplicate logical
 rows, but this is not an exactly-once scheduling guarantee.
 
 Failures expose a `failure_category` through `WriteError` and per-target dispatch
-results: `preflight_failed`, `conflict`, or `commit_unknown`. An advanced-mode
-failure makes the pipeline node fail and `seeknal run` exit unsuccessfully.
-Existing append/overwrite and PostgreSQL best-effort behavior is unchanged.
+results: `preflight_failed`, `conflict`, or `commit_unknown` (and `write_failed` /
+`preflight_failed` for PostgreSQL targets). An Iceberg advanced-mode failure or a
+PostgreSQL target failure (which is required by default unless `required: false`
+is set on the PostgreSQL target) makes the pipeline node fail and `seeknal run`
+(sequential and `--parallel`) exit non-zero. Note the asymmetry: Iceberg basic
+`append`/`overwrite` targets remain best-effort, whereas Iceberg advanced modes
+(`upsert`, `insert_overwrite`) and `postgresql` targets are required by default.
+When a node defines multiple `materializations:` targets, all targets still run
+in list order and targets that succeeded are not rolled back; per-target outcomes
+are recorded in the result metadata so partial success is visible.
 
 A failed or interrupted write may leave staged files that are not referenced by
 any committed snapshot. The writer deliberately does not delete them: a lost

@@ -389,6 +389,37 @@ class TestLogging:
         error_messages = [r.message for r in caplog.records if r.levelno == logging.ERROR]
         assert any("boom" in m for m in error_messages)
 
+    def test_dispatch_scrubs_secrets_from_error_logs_and_results(
+        self, dispatcher, mock_con, caplog
+    ):
+        """DSN userinfo and password=... values in exceptions are scrubbed before logging and storing."""
+        secret = "MyTopSecretPwd123!"
+        exc_msg = (
+            f"could not connect to postgresql://svc:{secret}@db.example.com:5432/prod "
+            f"password={secret}"
+        )
+        with (
+            caplog.at_level(logging.ERROR, logger="seeknal.workflow.materialization.dispatcher"),
+            patch.object(
+                dispatcher,
+                "_materialize_postgresql",
+                side_effect=RuntimeError(exc_msg),
+            ),
+        ):
+            res = dispatcher.dispatch(
+                mock_con,
+                "v",
+                [{"type": "postgresql", "connection": "pg1", "table": "public.t"}],
+                node_id="transform.orders",
+            )
+
+        assert res.required_failed is True
+        assert secret not in res.results[0]["error"]
+        assert "svc:" not in res.results[0]["error"]
+        for record in caplog.records:
+            assert secret not in record.getMessage()
+            assert "svc:" not in record.getMessage()
+
 
 # ---------------------------------------------------------------------------
 # Profile loader integration
