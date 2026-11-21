@@ -1161,15 +1161,16 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
         assert len(tracked_conns) == 1
         assert tracked_conns[0].closed != 0
 
-        # 2. With the probe SQL set to SELECT pg_sleep(1) through the private _PROBE_SQL hook
-        #    (monkeypatch) and a 50 ms probe timeout, the probe returns not-ready,
-        #    last_probe_pgcode == "57014", and no wake call happened.
-        monkeypatch.setattr(lb_mod, "_PROBE_SQL", "SELECT pg_sleep(1)")
+        # 2. With the probe SQL set to SELECT pg_sleep(5) through the private _PROBE_SQL hook
+        #    (monkeypatch) and a 500 ms probe timeout, the probe connect has its own 500 ms budget,
+        #    the slow probe query is cancelled by PostgreSQL with last_probe_pgcode == "57014",
+        #    and no wake call happened.
+        monkeypatch.setattr(lb_mod, "_PROBE_SQL", "SELECT pg_sleep(5)")
         with connector._lock:
             connector._state = "unavailable"
             connector._last_no_wake_probe_at = None
 
-        state_slow = connector.probe_no_wake(timeout_seconds=0.05, min_interval_seconds=0.0)
+        state_slow = connector.probe_no_wake(timeout_seconds=0.5, min_interval_seconds=0.0)
         assert state_slow == "unavailable"
         assert state_slow != "ok"
         assert connector.state != "ok"
@@ -1187,7 +1188,7 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
             connector._state = "unavailable"
             connector._last_no_wake_probe_at = None
 
-        state_auto = connector.probe_no_wake(timeout_seconds=0.05, min_interval_seconds=0.0)
+        state_auto = connector.probe_no_wake(timeout_seconds=0.5, min_interval_seconds=0.0)
         assert state_auto == "unavailable"
         assert state_auto != "ok"
         assert connector.state != "ok"
