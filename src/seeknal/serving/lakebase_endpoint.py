@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import inspect
 import logging
 import math
@@ -1584,6 +1585,9 @@ class ColdStartConnector:
                                     pass
                     probe_succeeded = True
                     break
+                except (NameError, AttributeError, TypeError) as exc:
+                    logger.error("Programming error during probe_no_wake: %s", exc, exc_info=True)
+                    raise
                 except Exception as exc:
                     if _classify_non_wakeable_connect_error(exc) is not None:
                         continue
