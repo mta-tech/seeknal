@@ -1114,6 +1114,10 @@ class ColdStartConnector:
             if not callable(executor) and not callable(getattr(executor, "submit", None)):
                 raise TypeError("executor must be callable or have a submit method")
         self._executor = executor
+        self._probe_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix=f"lakebase-probe-{self._engine_name}",
+        )
         self._last_wake_worker: threading.Thread | None = None
         self._uses_real_clock = (clock is time.monotonic) and (sleep_fn is time.sleep)
 
@@ -1521,8 +1525,12 @@ class ColdStartConnector:
             )
             with self._lock:
                 candidate_fns = list(self._account_connect_fns) or [self._connect_fn]
+            overall_deadline = time.monotonic() + eff_timeout
             probe_succeeded = False
             for target_fn in candidate_fns:
+                remaining = overall_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
                 conn: Any = None
                 cur: Any = None
                 try:
@@ -1547,18 +1555,24 @@ class ColdStartConnector:
                                     return target_fn()
                         return target_fn()
 
-                    if eff_timeout < 1.0:
-                        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    timed_out_tracker = {"timed_out": False}
+
+                    def _on_done(f: concurrent.futures.Future) -> None:
                         try:
-                            fut = pool.submit(_attempt_target_connect)
-                            conn = fut.result(timeout=eff_timeout)
-                        except concurrent.futures.TimeoutError:
-                            conn = None
-                            continue
-                        finally:
-                            pool.shutdown(wait=False)
-                    else:
-                        conn = _attempt_target_connect()
+                            res = f.result()
+                            if timed_out_tracker["timed_out"] and res is not None:
+                                _safe_close_conn(res)
+                        except Exception:
+                            pass
+
+                    fut = self._probe_executor.submit(_attempt_target_connect)
+                    fut.add_done_callback(_on_done)
+                    try:
+                        conn = fut.result(timeout=max(0.001, remaining))
+                    except concurrent.futures.TimeoutError:
+                        timed_out_tracker["timed_out"] = True
+                        conn = None
+                        continue
 
                     if conn is None:
                         continue
