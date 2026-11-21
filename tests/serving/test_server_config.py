@@ -1309,4 +1309,24 @@ def test_parse_jwks_refuses_non_canonical_coordinate():
         with pytest.raises(ServerConfigError, match="invalid base64url coordinate"):
             parse_jwks({"keys": [bad_jwk]})
 
+        # Find non-canonical last character for y coordinate that decodes to the exact same bytes
+        non_canonical_y = None
+        for c in alphabet:
+            if c == y_b64[-1]:
+                continue
+            cand = y_b64[:-1] + c
+            cand_padded = cand + ("=" * ((4 - len(cand) % 4) % 4))
+            try:
+                cand_bytes = base64.urlsafe_b64decode(cand_padded.encode("ascii"))
+                if cand_bytes == y_bytes:
+                    non_canonical_y = cand
+                    break
+            except Exception:
+                pass
+
+        assert non_canonical_y is not None, "Failed to find non-canonical y coordinate"
+        bad_jwk_y = dict(valid_jwk, y=non_canonical_y)
+        with pytest.raises(ServerConfigError, match="invalid base64url coordinate"):
+            parse_jwks({"keys": [bad_jwk_y]})
+
 

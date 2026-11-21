@@ -221,11 +221,11 @@ class PreflightResult:
     schemas: dict[str, list[str]] | None = None
 
 
-_B64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_B64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\Z")
 
 
 def _b64url_decode(s: str) -> bytes:
-    if not isinstance(s, str) or not s or not _B64URL_PATTERN.match(s):
+    if not isinstance(s, str) or not s or not _B64URL_PATTERN.fullmatch(s):
         raise ServerConfigError("Invalid base64url segment")
     rem = len(s) % 4
     if rem == 1:
