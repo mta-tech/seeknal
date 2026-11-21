@@ -1092,13 +1092,13 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
     seeded_cbn_cluster: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """L5/M2: Prove probe timeout applies via set_config inside explicit transaction on the real connect path.
+    """L5/M2: Prove probe timeout applies via set_config inside explicit transaction during no-wake probe.
 
     Live coverage excludes the Lakebase TLS (verify-full) branch; covered by unit tests
     and by the pre-deploy check against a real Lakebase/Neon endpoint.
 
-    With probe timeout set to 50 ms (0.050 s), a probe query of 'SELECT pg_sleep(1)' is cancelled
-    by PostgreSQL with SQLSTATE 57014, and the probe reports not-ready without any wake call.
+    With probe timeout set to 500 ms, a slow probe query is cancelled by PostgreSQL with SQLSTATE 57014,
+    and the probe reports not-ready without any wake call.
     Also tests positive control (fast query -> ok) and autocommit connection proving BEGIN/ROLLBACK applies.
     """
     import seeknal.serving.lakebase_endpoint as lb_mod
