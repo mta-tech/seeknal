@@ -1201,6 +1201,16 @@ def test_live_probe_timeout_cancels_slow_query_and_reports_not_ready(
             "ready": False,
             "engines": {"lb_probe": "unavailable"},
         }
+        # Bounded wait until the in-flight probe triggered by /readyz finishes and records last_probe_pgcode
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            with connector._lock:
+                if not connector._no_wake_probe_in_flight:
+                    break
+            time.sleep(0.01)
+        with connector._lock:
+            assert not connector._no_wake_probe_in_flight
+
         assert connector.state == "unavailable"
         assert connector.last_probe_pgcode == "57014"
         assert len(wake_calls) == 0
