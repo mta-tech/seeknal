@@ -1697,11 +1697,12 @@ class ColdStartConnector:
                 op = self._get_or_start_wake(connect_kwargs, eff_connect_fn)
             else:
                 with self._lock:
-                    self._state = "ok"
-                    self._last_cold_start = False
-                    self._failed_until = None
-                    self._last_no_wake_probe_at = None
-                    self._emit_state("ok")
+                    if self._active_wake is None or self._active_wake.done:
+                        self._state = "ok"
+                        self._last_cold_start = False
+                        self._failed_until = None
+                        self._last_no_wake_probe_at = None
+                        self._emit_state("ok")
                 self._tls.cold_start = False
                 return conn
         else:
@@ -1765,14 +1766,16 @@ class ColdStartConnector:
             if non_wakeable is not None:
                 raise non_wakeable from None
             with self._lock:
-                self._state = "unavailable"
-                self._emit_state("unavailable")
+                if self._active_wake is None or self._active_wake.done:
+                    self._state = "unavailable"
+                    self._emit_state("unavailable")
             raise EngineError("Engine connection failed") from None
 
         with self._lock:
-            self._state = "ok"
-            self._last_cold_start = True
-            self._failed_until = None
-            self._last_no_wake_probe_at = None
-            self._emit_state("ok")
+            if self._active_wake is None or self._active_wake.done:
+                self._state = "ok"
+                self._last_cold_start = True
+                self._failed_until = None
+                self._last_no_wake_probe_at = None
+                self._emit_state("ok")
         return conn

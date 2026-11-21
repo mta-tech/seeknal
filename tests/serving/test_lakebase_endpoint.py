@@ -1716,4 +1716,70 @@ def test_l1_executor_validation_and_failed_launch_finalises_op():
     assert connector.state == "unavailable"
 
 
+def test_l2_plain_connect_failure_does_not_overwrite_newer_wake_state():
+    """L2: A plain connect failing while a newer wake is in flight leaves state 'starting'."""
+    cfg = _make_wake_cfg(max_query_wait_seconds=5.0, max_wake_seconds=10.0)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def connect_fn(**kw: Any) -> Any:
+        entered.set()
+        release.wait(timeout=2.0)
+        raise ConnectionRefusedError("plain connect failed")
+
+    connector = ColdStartConnector(
+        connect_fn,
+        cfg,
+        engine_name="lb_l2",
+        env={"LB_OPS_PROJECT_TOKEN": "tok-l2"},
+    )
+
+    from seeknal.serving.lakebase_endpoint import _WakeOperation
+
+    # Initial wake that completed with ok (no claimed_conn so fallthrough to plain connect)
+    initial_op = _WakeOperation(
+        started_at=0.0,
+        wake_deadline=10.0,
+        connect_kwargs={},
+        opener_connect_fn=connect_fn,
+    )
+    initial_op.done = True
+    initial_op.outcome = "ok"
+    initial_op.finished_at = 1.0
+
+    newer_op = _WakeOperation(
+        started_at=2.0,
+        wake_deadline=12.0,
+        connect_kwargs={},
+        opener_connect_fn=connect_fn,
+    )
+
+    with connector._cond:
+        connector._active_wake = initial_op
+
+    def run() -> None:
+        try:
+            connector.connect(connect_fn=connect_fn)
+        except EngineError:
+            pass
+
+    t = threading.Thread(target=run)
+    t.start()
+    assert entered.wait(timeout=2.0)
+
+    # While plain connect is running, a newer wake is in flight:
+    with connector._lock:
+        connector._active_wake = newer_op
+        connector._state = "starting"
+
+    release.set()
+    t.join(timeout=2.0)
+
+    # State must remain "starting", not overwritten to "unavailable"
+    assert connector.state == "starting"
+
+
+
+
 
